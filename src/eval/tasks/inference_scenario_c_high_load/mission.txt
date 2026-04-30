@@ -1,0 +1,1 @@
+Handle maximum concurrent users without errors. Optimize total throughput under burst, poisson, and constant load.

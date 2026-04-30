@@ -1,0 +1,71 @@
+{
+  "engine": "sglang",
+  "doc_refs": [
+    "https://docs.sglang.io/docs/advanced_features/hyperparameter_tuning",
+    "https://docs.sglang.io/advanced_features/attention_backend.html",
+    "https://docs.sglang.io/advanced_features/speculative_decoding.html",
+    "https://docs.sglang.io/advanced_features/server_arguments.html"
+  ],
+  "parameters": [
+    {
+      "name": "max_running_requests",
+      "flag": "--max-running-requests",
+      "type": "choice",
+      "values": [16, 32, 64, 128, 256]
+    },
+    {
+      "name": "chunked_prefill_size",
+      "flag": "--chunked-prefill-size",
+      "type": "choice",
+      "values": [2048, 4096, 8192]
+    },
+    {
+      "name": "max_prefill_tokens",
+      "flag": "--max-prefill-tokens",
+      "type": "choice",
+      "values": [32768]
+    },
+    {
+      "name": "mem_fraction_static",
+      "flag": "--mem-fraction-static",
+      "type": "choice",
+      "values": [0.80, 0.85, 0.90]
+    },
+    {
+      "name": "attention_backend",
+      "flag": "--attention-backend",
+      "type": "choice",
+      "values": ["triton"]
+    },
+    {
+      "name": "quantization",
+      "flag": "--quantization",
+      "type": "choice",
+      "values": ["none"]
+    },
+    {
+      "name": "enable_torch_compile",
+      "flag": "--enable-torch-compile",
+      "type": "bool",
+      "values": [false]
+    },
+    {
+      "name": "schedule_policy",
+      "flag": "--schedule-policy",
+      "type": "choice",
+      "values": ["fcfs", "lpm"]
+    },
+    {
+      "name": "cuda_graph_max_bs",
+      "flag": "--cuda-graph-max-bs",
+      "type": "choice",
+      "values": [0]
+    },
+    {
+      "name": "speculative_num_steps",
+      "flag": "--speculative-num-steps",
+      "type": "choice",
+      "values": [0]
+    }
+  ]
+}

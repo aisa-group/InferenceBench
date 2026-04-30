@@ -1,0 +1,1 @@
+Maximize decoding speed for long outputs. Prioritize generation throughput while keeping responses coherent.

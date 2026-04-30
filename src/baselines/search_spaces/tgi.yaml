@@ -1,0 +1,62 @@
+{
+  "engine": "tgi",
+  "doc_refs": [
+    "https://huggingface.co/docs/text-generation-inference/basic_tutorials/launcher"
+  ],
+  "parameters": [
+    {
+      "name": "max_concurrent_requests",
+      "flag": "--max-concurrent-requests",
+      "type": "choice",
+      "values": [16, 32, 64, 128, 256]
+    },
+    {
+      "name": "max_batch_prefill_tokens",
+      "flag": "--max-batch-prefill-tokens",
+      "type": "choice",
+      "values": [1024, 2048, 4096, 8192, 16384]
+    },
+    {
+      "name": "max_batch_total_tokens",
+      "flag": "--max-batch-total-tokens",
+      "type": "choice",
+      "values": [8192, 16384, 32768, 65536, 131072]
+    },
+    {
+      "name": "max_waiting_tokens",
+      "flag": "--max-waiting-tokens",
+      "type": "choice",
+      "values": [20, 100, 500]
+    },
+    {
+      "name": "cuda_graphs",
+      "flag": "--cuda-graphs",
+      "type": "choice",
+      "values": ["0", "1,2,4,8,16", "1,2,4,8,16,32"]
+    },
+    {
+      "name": "quantize",
+      "flag": "--quantize",
+      "type": "choice",
+      "values": ["none", "bitsandbytes", "gptq", "awq", "eetq", "fp8"]
+    },
+    {
+      "name": "cuda_memory_fraction",
+      "flag": "--cuda-memory-fraction",
+      "type": "choice",
+      "values": [0.85, 0.90, 0.95, 1.0]
+    },
+    {
+      "name": "waiting_served_ratio",
+      "flag": "--waiting-served-ratio",
+      "type": "choice",
+      "values": [0.3, 1.2, 2.0]
+    },
+    {
+      "name": "max_batch_size",
+      "flag": "--max-batch-size",
+      "type": "choice",
+      "values": ["none", 16, 32, 64]
+    }
+  ]
+}

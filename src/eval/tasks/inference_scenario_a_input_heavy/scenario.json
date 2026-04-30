@@ -1,0 +1,20 @@
+{
+  "scenario_id": "A",
+  "name": "Input heavy",
+  "data_source": "longbench_v2",
+  "synthetic": {
+    "input_len": 8192,
+    "output_len": 1024,
+    "range_ratio": 0.8,
+    "ignore_eos": true
+  },
+  "num_requests": 128,
+  "max_new_tokens": 1024,
+  "temperature": 0.2,
+  "concurrency": 1,
+  "quality_max_new_tokens": 256,
+  "profile": {
+    "name": "burst",
+    "pattern": "burst"
+  }
+}

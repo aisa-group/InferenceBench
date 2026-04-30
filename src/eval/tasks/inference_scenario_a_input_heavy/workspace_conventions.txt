@@ -1,0 +1,16 @@
+- Create ONE top-level directory for your work: `agent/`.
+- At the start, create a run folder: `agent/run_YYYYMMDD_HHMMSS/` (UTC).
+- Put all new files under that run folder:
+  - `agent/run_.../notes.md` (what you tried + why)
+  - `agent/run_.../logs/<name>.log` (server + sweep logs)
+  - `agent/run_.../exp/<exp_name>/...` (all sweep outputs; avoid creating `sweep_tmp*` at repo root)
+  - `agent/run_.../tmp/...` (throwaway)
+- `start_server.sh` is the benchmark-owned launcher you are expected to edit.
+- Treat these benchmark-owned files as read-only (do not create/overwrite them):
+  - `test_server.sh`
+  - `/opt/inference_eval/bin/launch_supervised_server.sh`
+  - `evaluate.py`, `metrics.json`,
+  - `eval_generations.jsonl`, `requests_used.jsonl`
+  - `requests.jsonl` (if you need a subset, write `agent/.../requests_subset.jsonl`)
+- Do not rely on detached daemons; use `./test_server.sh` if you want to launch `./start_server.sh` under the harness scaffold.
+- When doing quick experiments, ALWAYS pass `--requests-file` to `evaluate.py`; never rely on implicit defaults.

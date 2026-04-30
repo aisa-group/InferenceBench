@@ -1,0 +1,37 @@
+{
+  "scenario_id": "C",
+  "name": "High load",
+  "data_source": "longbench_v2",
+  "synthetic": {
+    "input_len": 1024,
+    "output_len": 1024,
+    "range_ratio": 0.8,
+    "ignore_eos": true
+  },
+  "num_requests": 256,
+  "max_new_tokens": 1024,
+  "temperature": 0.3,
+  "concurrency": 32,
+  "profiles": [
+    {
+      "name": "burst",
+      "pattern": "burst",
+      "num_requests": 256,
+      "concurrency": 64
+    },
+    {
+      "name": "poisson",
+      "pattern": "poisson",
+      "rate_per_s": 32,
+      "num_requests": 256,
+      "concurrency": 32
+    },
+    {
+      "name": "constant",
+      "pattern": "constant",
+      "rate_per_s": 16,
+      "num_requests": 256,
+      "concurrency": 16
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+Bootstrap: docker
+From: ghcr.io/huggingface/text-generation-inference:latest
+
+%post
+    # The upstream TGI image already ships `text-generation-launcher` on PATH with
+    # matching CUDA kernels. We only need to add filelock workarounds to match the
+    # other baseline containers for /fast (Lustre) compatibility.
+    mkdir -p /opt
+    cd /opt
+    git clone https://github.com/rank-and-file/filelock_workarounds.git || true
+
+%environment
+    export NO_PROXY="localhost,127.0.0.1"
+    export no_proxy="localhost,127.0.0.1"
+    export PYTHONPATH="/opt/filelock_workarounds/soft_file_locks:${PYTHONPATH:-}"
+
+%runscript
+    exec text-generation-launcher "$@"
+
+%labels
+    Version v1.0
+    Description HuggingFace text-generation-inference baseline (pinned 3.3.5)
+
+%help
+    Note: Use the --nv flag to enable NVIDIA GPU support when running the container.

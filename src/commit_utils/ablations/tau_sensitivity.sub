@@ -1,0 +1,13 @@
+executable = /bin/bash
+arguments = src/commit_utils/ablations/run_tau_sensitivity.sh
+environment = "HOME=$ENV(HOME) INFERENCE_BENCH_RESULTS_DIR=$ENV(INFERENCE_BENCH_RESULTS_DIR) TAU_OUT_DIR=$ENV(TAU_OUT_DIR)"
+error = tau_sensitivity_$(Cluster).err
+output = tau_sensitivity_$(Cluster).out
+log = tau_sensitivity_$(Cluster).log
+request_memory = 4000
+request_cpus = 1
+request_gpus = 0
+request_disk = 2G
+stream_output = true
+stream_error = true
+queue

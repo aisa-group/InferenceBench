@@ -1,0 +1,19 @@
+Bootstrap: docker
+From: python:3.10-slim
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+
+    pip install --no-cache-dir \
+        "datasets>=4.0" \
+        "huggingface-hub>=0.36.0" \
+        "transformers" \
+        "filelock" \
+        "fsspec" \
+        "aiohttp"
+
+%runscript
+    exec python3 "$@"
+
+%labels
+    Description Lightweight container for downloading HuggingFace models and datasets

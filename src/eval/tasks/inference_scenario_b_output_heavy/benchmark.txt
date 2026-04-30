@@ -1,0 +1,1 @@
+InferenceBench Scenario B: Output heavy (decoding speed)

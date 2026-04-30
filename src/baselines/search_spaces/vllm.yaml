@@ -1,0 +1,77 @@
+{
+  "engine": "vllm",
+  "doc_refs": [
+    "https://docs.vllm.ai/en/latest/features/speculative_decoding/n_gram/",
+    "https://docs.vllm.ai/en/v0.11.0/api/vllm/config/speculative.html"
+  ],
+  "parameters": [
+    {
+      "name": "max_num_seqs",
+      "flag": "--max-num-seqs",
+      "type": "choice",
+      "values": [16, 32, 64, 128, 256, 512]
+    },
+    {
+      "name": "max_num_batched_tokens",
+      "flag": "--max-num-batched-tokens",
+      "type": "choice",
+      "values": [1024, 2048, 4096, 8192, 16384]
+    },
+    {
+      "name": "gpu_memory_utilization",
+      "flag": "--gpu-memory-utilization",
+      "type": "choice",
+      "values": [0.80, 0.85, 0.90, 0.95]
+    },
+    {
+      "name": "block_size",
+      "flag": "--block-size",
+      "type": "choice",
+      "values": [16, 32]
+    },
+    {
+      "name": "enable_chunked_prefill",
+      "flag": "--enable-chunked-prefill",
+      "false_flag": "--no-enable-chunked-prefill",
+      "type": "bool",
+      "values": [true, false]
+    },
+    {
+      "name": "enable_prefix_caching",
+      "flag": "--enable-prefix-caching",
+      "false_flag": "--no-enable-prefix-caching",
+      "type": "bool",
+      "values": [true, false]
+    },
+    {
+      "name": "enforce_eager",
+      "flag": "--enforce-eager",
+      "type": "bool",
+      "values": [true, false]
+    },
+    {
+      "name": "quantization",
+      "flag": "--quantization",
+      "type": "choice",
+      "values": ["none", "fp8"]
+    },
+    {
+      "name": "kv_cache_dtype",
+      "flag": "--kv-cache-dtype",
+      "type": "choice",
+      "values": ["auto", "fp8"]
+    },
+    {
+      "name": "attention_backend",
+      "flag": "VLLM_ATTENTION_BACKEND",
+      "type": "choice",
+      "values": ["FLASH_ATTN", "FLASHINFER", "TRITON_ATTN"]
+    },
+    {
+      "name": "num_speculative_tokens",
+      "flag": "--speculative-config",
+      "type": "choice",
+      "values": [0, 3, 5, 7]
+    }
+  ]
+}

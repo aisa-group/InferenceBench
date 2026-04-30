@@ -1,0 +1,14 @@
+executable = /bin/bash
+arguments = src/commit_utils/baselines/download_model_run.sh $(model)
+environment = "HOME=$ENV(HOME) HF_HOME=$ENV(HF_HOME) HF_TOKEN=$ENV(HF_TOKEN) DL_MODEL=$(model) INFERENCE_BENCH_CONTAINERS_DIR=$ENV(INFERENCE_BENCH_CONTAINERS_DIR) INFERENCE_BENCH_CONTAINER_NAME=$ENV(INFERENCE_BENCH_CONTAINER_NAME)"
+error = download_model_$(Cluster).err
+output = download_model_$(Cluster).out
+log = download_model_$(Cluster).log
+request_memory = 200000
+request_cpus = 4
+request_gpus = 0
+request_disk = 400G
++BypassLXCfs = "true"
+stream_output = true
+stream_error = true
+queue

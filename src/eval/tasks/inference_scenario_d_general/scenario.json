@@ -1,0 +1,19 @@
+{
+  "scenario_id": "D",
+  "name": "General",
+  "data_source": "longbench_v2",
+  "synthetic": {
+    "input_len": 4096,
+    "output_len": 2048,
+    "range_ratio": 0.8,
+    "ignore_eos": true
+  },
+  "num_requests": 96,
+  "max_new_tokens": 2048,
+  "temperature": 0.4,
+  "concurrency": 4,
+  "profile": {
+    "name": "burst",
+    "pattern": "burst"
+  }
+}

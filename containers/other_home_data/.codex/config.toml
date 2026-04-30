@@ -1,0 +1,6 @@
+[projects."/home/"]
+trust_level = "trusted"
+
+[shell_environment_policy]
+inherit = "all"
+set = { CI = "1", LD_LIBRARY_PATH = "/usr/local/cuda/lib64:/.singularity.d/libs", PATH = "/root/.local/bin:/home/agent/.local/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin", HF_HOME = "/home/agent/hf_cache", HF_HUB_CACHE = "/home/agent/hf_cache/hub", HUGGINGFACE_HUB_CACHE = "/home/agent/hf_cache/hub", TRANSFORMERS_CACHE = "/home/agent/hf_cache/hub", HOME = "/home/agent" }
