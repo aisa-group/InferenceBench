@@ -2,11 +2,11 @@
 
 InferenceBench measures whether autonomous CLI agents can act as ML systems engineers in a genuinely open-ended setting. Each run gives the agent a base LLM, a single NVIDIA H100, a wall-clock budget, and a scenario-specific objective; the agent must deliver a running, OpenAI-compatible inference server that maximizes the scenario's primary metric while passing both a quality gate and an integrity gate.
 
-Unlike narrower benchmarks where the action space collapses to hyperparameter tuning over a known recipe, inference systems engineering forces real composition choices — inference framework, attention backend, quantization format, KV-cache layout, scheduler tuning — under brittle infrastructure where wrong combinations crash on launch rather than degrading gracefully. The benchmark is designed to test whether agents *search* an open engineering space or *retrieve* memorized configurations from it.
+Unlike narrower benchmarks where the action space collapses to hyperparameter tuning over a known recipe, inference systems engineering forces real composition choices such as inference framework, attention backend, quantization format, KV-cache layout, scheduler tuning under brittle infrastructure where wrong combinations crash on launch rather than degrading gracefully. The benchmark is designed to test whether agents *search* an open engineering space or *retrieve* memorized configurations from it.
 
 ## Headline Result
 
-Across 14 frontier agent configurations on Mistral-7B-Instruct-v0.3 with a 2-hour budget per run, agents reliably beat a naïve PyTorch reference and often match or exceed default-configuration serving engines — but **non-agent search (Random / SMAC3 / TPE) given the same 2-hour budget on vLLM beats every agent on every scenario**. Behavioral analysis shows the bottleneck is not domain knowledge:
+Across 14 frontier agent configurations on Mistral-7B-Instruct-v0.3 with a 2-hour budget per run, agents reliably beat a naïve PyTorch reference and often match or exceed default-configuration serving engines, but **non-agent search (Random / SMAC3 / TPE) given the same 2-hour budget on vLLM beats every agent on every scenario**. Behavioral analysis shows the bottleneck is not domain knowledge:
 
 - **94%** of agent runs ship a vLLM-based final launcher, even though SGLang, TGI, and TensorRT-LLM are explicitly mentioned in the prompt.
 - The median run launches **exactly one** non-default vLLM configuration over the full 2 h budget.
@@ -184,10 +184,10 @@ Each wrapper receives the identical prompt template (see `src/eval/general/promp
 
 PyTorch is the **naïve reference baseline** (a minimal aiohttp+`AutoModelForCausalLM` server with on-the-fly token streaming via `TextIteratorStreamer`). The serving-engine baselines and matched-budget search are run against:
 
-- **vLLM** (`inference_baselines_vllm.def`) — the primary baseline used in matched-budget search
+- **vLLM** (`inference_baselines_vllm.def`)
 - **SGLang** (`inference_baselines_sglang.def`)
 - **HuggingFace TGI** (`inference_baselines_tgi.def`)
-- **PyTorch / Transformers** (`inference_baselines_torch.def`) — naïve reference, ratio = 1.0 by definition
+- **PyTorch / Transformers** (`inference_baselines_torch.def`)
 
 To precompute or refresh baselines for a model:
 
