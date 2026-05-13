@@ -1,8 +1,27 @@
-# InferenceBench: A Benchmark for Open-Ended LLM Inference Optimization by AI Agents
+<div align="center">
+
+<h1>InferenceBench: A Benchmark for Open-Ended LLM Inference Optimization by AI Agents</h1>
+
+[![arXiv](https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv)]()
+
+</div>
+
+This is the official repository for the paper
+"_InferenceBench: A Benchmark for Open-Ended LLM Inference Optimization by AI Agents_".
+
+Authors:
+[Jehyeok Yeon](https://jeybird248.github.io/),
+[Ben Rank](https://benrank.com/),
+[Maksym Andriushchenko](https://www.andriushchenko.me/)
+---
+
+## Overview
 
 InferenceBench measures whether autonomous CLI agents can act as ML systems engineers in a genuinely open-ended setting. Each run gives the agent a base LLM, a single NVIDIA H100, a wall-clock budget, and a scenario-specific objective; the agent must deliver a running, OpenAI-compatible inference server that maximizes the scenario's primary metric while passing both a quality gate and an integrity gate.
 
 Unlike narrower benchmarks where the action space collapses to hyperparameter tuning over a known recipe, inference systems engineering forces real composition choices such as inference framework, attention backend, quantization format, KV-cache layout, scheduler tuning under brittle infrastructure where wrong combinations crash on launch rather than degrading gracefully. The benchmark is designed to test whether agents *search* an open engineering space or *retrieve* memorized configurations from it.
+
+![Overview of InferenceBench](fig0.pdf "Overview of InferenceBench")
 
 ## Headline Result
 Across 15 frontier agent configurations on Mistral-7B-Instruct-v0.3 with a 2-hour budget per run, agents reliably beat a naïve PyTorch reference and often match or exceed default-configuration serving engines, but **non-agent search (Random / SMAC3 / TPE) given the same 2-hour budget on vLLM beats every agent on every scenario**. Behavioral analysis shows the bottleneck is not domain knowledge:
