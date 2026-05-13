@@ -21,7 +21,7 @@ InferenceBench measures whether autonomous CLI agents can act as ML systems engi
 
 Unlike narrower benchmarks where the action space collapses to hyperparameter tuning over a known recipe, inference systems engineering forces real composition choices such as inference framework, attention backend, quantization format, KV-cache layout, scheduler tuning under brittle infrastructure where wrong combinations crash on launch rather than degrading gracefully. The benchmark is designed to test whether agents *search* an open engineering space or *retrieve* memorized configurations from it.
 
-![Overview of InferenceBench](fig0.pdf "Overview of InferenceBench")
+[Overview of InferenceBench](fig0-1.png)
 
 ## Headline Result
 Across 15 frontier agent configurations on Mistral-7B-Instruct-v0.3 with a 2-hour budget per run, agents reliably beat a naïve PyTorch reference and often match or exceed default-configuration serving engines, but **non-agent search (Random / SMAC3 / TPE) given the same 2-hour budget on vLLM beats every agent on every scenario**. Behavioral analysis shows the bottleneck is not domain knowledge:
