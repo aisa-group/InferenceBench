@@ -2,8 +2,6 @@
 
 <h1>InferenceBench: A Benchmark for Open-Ended LLM Inference Optimization by AI Agents</h1>
 
-[![arXiv](https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv)]()
-
 </div>
 
 This is the official repository for the paper
