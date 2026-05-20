@@ -359,12 +359,14 @@ def primary_metric(metrics: dict[str, Any], scenario: str) -> tuple[float, str |
 
 
 def gate_passed(metrics: dict[str, Any]) -> bool:
+    if metrics.get("error"):
+        return False
     if metrics.get("score") == 0:
         return False
-    qc = metrics.get("quality_check") or {}
-    if qc.get("pass") is False:
+    qc = metrics.get("quality_check")
+    if not isinstance(qc, dict):
         return False
-    return True
+    return qc.get("pass") is True
 
 
 def _run_text(cmd: list[str], timeout_s: float = 20.0) -> str:
