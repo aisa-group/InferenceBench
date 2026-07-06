@@ -142,3 +142,15 @@ def test_gate_passed_ignores_legacy_success_gate_field():
 def test_gate_passed_still_fails_quality_and_zero_score():
     assert not hpo.gate_passed({"score": 0, "quality_check": {"pass": True}})
     assert not hpo.gate_passed({"quality_check": {"pass": False}})
+
+
+def test_gate_passed_requires_explicit_successful_quality_check():
+    assert hpo.gate_passed({"quality_check": {"pass": True}})
+    assert not hpo.gate_passed({})
+    assert not hpo.gate_passed({"quality_check": {}})
+    assert not hpo.gate_passed(
+        {
+            "error": "evaluate.py exited with code 1",
+            "quality_check": {"pass": True},
+        }
+    )
