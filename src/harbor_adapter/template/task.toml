@@ -1,0 +1,44 @@
+version = "1.0"
+
+[metadata]
+author_name = "InferenceBench"
+category = "llm-inference"
+tags = ["inference", "serving", "llm", "gpu"]
+
+[environment]
+gpus = 1
+gpu_types = ["H100!"]
+cpus = 16
+memory_mb = 180000
+storage_mb = 409600
+build_timeout_sec = 3600.0
+workdir = "/home/agent/task"
+
+[environment.healthcheck]
+command = "test -f /timer_start || { python3 -c 'import os, huggingface_hub; huggingface_hub.snapshot_download(os.environ[\"INFERENCE_BENCH_BASE_MODEL\"])' && chown -R agent:agent /home/agent/hf_cache && date +%s > /timer_start; }"
+interval_sec = 10
+timeout_sec = 3600
+start_period_sec = 0
+retries = 5
+
+[agent]
+timeout_sec = 7200.0
+user = "agent"
+
+[verifier]
+timeout_sec = 43200.0
+environment_mode = "separate"
+
+[verifier.environment]
+gpus = 1
+gpu_types = ["H100!"]
+cpus = 16
+memory_mb = 180000
+storage_mb = 409600
+build_timeout_sec = 3600.0
+
+[[verifier.collect]]
+service = "main"
+user = "root"
+timeout_sec = 3600.0
+command = "bash /usr/local/bin/collect.sh"

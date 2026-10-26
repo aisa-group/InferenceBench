@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
-"""Non-agentic HPO baselines for InferenceBench inference serving.
-
-This runner implements the shared per-trial protocol for random search,
-Optuna TPE, and SMAC3 across vLLM, SGLang, and TGI.  It intentionally keeps
-invalid flag combinations in the search space: startup failures are recorded
-as near-zero scores so the optimizer learns from them without privileged
-filtering.
-"""
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
-import hashlib
+from importlib import metadata
 import json
+import math
 import os
 import random
 import shlex
-import signal
 import subprocess
 import sys
 import time
@@ -25,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from src.eval.inference import precompute_all_baselines as _pb
+from src.eval.inference.precompute_all_baselines import _repo_root
+from src.eval.inference.quality_gate import DEFAULT_SEED, speed_profiles_complete
 
 
 SCENARIOS = {
@@ -69,20 +64,12 @@ class TrialResult:
 
 
 SGLANG_STABLE_SEARCH_VALUES: dict[str, set[Any]] = {
-    # The default HPO baseline targets the unquantized Mistral checkpoint on the
-    # shared H100 cluster. These knobs are syntactically valid in SGLang but have
-    # repeatedly caused startup failures, long graph-capture stalls, or
-    # model-specific quantization errors in that environment.
     "attention_backend": {"triton"},
     "quantization": {"none"},
     "enable_torch_compile": {False},
     "cuda_graph_max_bs": {0},
     "speculative_num_steps": {0},
 }
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
 
 
 def _utc_now() -> str:
@@ -97,38 +84,28 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
-def _load_json_or_yaml(path: Path) -> dict[str, Any]:
-    text = path.read_text(encoding="utf-8")
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        try:
-            import yaml  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError(
-                f"{path} is not JSON and PyYAML is not installed"
-            ) from exc
-        data = yaml.safe_load(text)
-        if not isinstance(data, dict):
-            raise ValueError(f"{path} did not contain a mapping")
-        return data
-
-
 def load_search_space(engine: str, path: Path | None = None) -> tuple[dict[str, Any], list[SearchParam]]:
-    if path is None:
-        path = _repo_root() / "src" / "baselines" / "search_spaces" / f"{engine}.yaml"
-    raw = _load_json_or_yaml(path)
+    path = path or _repo_root() / "src" / "baselines" / "search_spaces" / f"{engine}.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path} did not contain a mapping")
     params: list[SearchParam] = []
+    names: set[str] = set()
     for item in raw.get("parameters") or []:
-        params.append(
-            SearchParam(
-                name=str(item["name"]),
-                flag=str(item["flag"]),
-                kind=str(item.get("type", "choice")),
-                values=list(item["values"]),
-                false_flag=item.get("false_flag"),
-            )
-        )
+        name = str(item["name"])
+        values = item["values"]
+        if name in names:
+            raise ValueError(f"duplicate parameter {name}: {path}")
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"parameter {name} must have a nonempty values list: {path}")
+        if len({json.dumps(value, sort_keys=True) for value in values}) != len(values):
+            raise ValueError(f"parameter {name} has duplicate values: {path}")
+        if item.get("type", "choice") not in {"choice", "bool"}:
+            raise ValueError(f"unsupported parameter type for {name}: {path}")
+        if item.get("type") == "bool" and any(type(value) is not bool for value in values):
+            raise ValueError(f"parameter {name} requires boolean values: {path}")
+        names.add(name)
+        params.append(SearchParam(name, str(item["flag"]), str(item.get("type", "choice")), list(values), item.get("false_flag")))
     if not params:
         raise ValueError(f"empty search space: {path}")
     return raw, params
@@ -175,9 +152,19 @@ def validate_search_space(
     params: list[SearchParam],
     *,
     allow_unsafe: bool = False,
+    max_model_len: int = 32768,
 ) -> None:
-    """Fail early for known unsafe SGLang search-space settings."""
-
+    if engine == "vllm":
+        by_name = {param.name: param for param in params}
+        chunked = by_name.get("enable_chunked_prefill")
+        batch_tokens = by_name.get("max_num_batched_tokens")
+        if chunked is not None and False in chunked.values and batch_tokens is not None:
+            if any(int(value) < max_model_len for value in batch_tokens.values):
+                raise ValueError(
+                    "invalid vLLM HPO search space: disabling chunked prefill requires every "
+                    f"max_num_batched_tokens value to be at least max_model_len={max_model_len}"
+                )
+        return
     if engine != "sglang":
         return
 
@@ -234,11 +221,7 @@ def validate_search_space(
 
     if errors:
         detail = "\n  - ".join(errors)
-        raise ValueError(
-            "invalid SGLang HPO search space:\n"
-            f"  - {detail}\n"
-            "Use --allow-unsafe-search-space only for explicit canary/debug runs."
-        )
+        raise ValueError(f"invalid SGLang HPO search space:\n  - {detail}")
 
 
 def normalize_scenario(raw: str) -> str:
@@ -278,11 +261,20 @@ def search_space_size(params: list[SearchParam]) -> int:
 
 
 def _safe_p50(profile: dict[str, Any], group: str) -> float | None:
-    value = (profile.get(group) or {}).get("p50")
+    summary = profile.get(group)
+    value = summary.get("p50") if isinstance(summary, dict) else None
     return float(value) if isinstance(value, (int, float)) else None
 
 
 def profile_is_physical(profile: dict[str, Any]) -> bool:
+    values = [
+        profile.get("generation_throughput_tokens_per_s"),
+        profile.get("request_throughput_req_per_s"),
+        _safe_p50(profile, "tpot"),
+        _safe_p50(profile, "ttft"),
+    ]
+    if any(isinstance(value, (int, float)) and not math.isfinite(value) for value in values):
+        return False
     gen = profile.get("generation_throughput_tokens_per_s")
     if isinstance(gen, (int, float)) and gen > MAX_PHYSICAL_GEN_TPS:
         return False
@@ -304,6 +296,8 @@ def integrity_flags(metrics: dict[str, Any]) -> list[str]:
 
 
 def primary_metric(metrics: dict[str, Any], scenario: str) -> tuple[float, str | None]:
+    if not speed_profiles_complete(metrics):
+        return FAILURE_SCORE, "incomplete_speed_profile"
     profiles = metrics.get("profiles") or {}
     burst = profiles.get("burst")
     if not isinstance(burst, dict):
@@ -311,19 +305,20 @@ def primary_metric(metrics: dict[str, Any], scenario: str) -> tuple[float, str |
     if not profile_is_physical(burst):
         return FAILURE_SCORE, "integrity_failed"
 
-    if scenario == "inference_scenario_a_input_heavy":
+    short = SCENARIO_TO_SHORT.get(scenario)
+    if short == "a":
         ttft = _safe_p50(burst, "ttft")
         if not ttft or ttft <= 0:
             return FAILURE_SCORE, "missing_ttft"
         return 1.0 / ttft, "1/ttft_p50"
 
-    if scenario == "inference_scenario_b_output_heavy":
+    if short == "b":
         tpot = _safe_p50(burst, "tpot")
         if not tpot or tpot <= 0:
             return FAILURE_SCORE, "missing_tpot"
         return 1.0 / tpot, "1/tpot_p50"
 
-    if scenario == "inference_scenario_c_high_load":
+    if short == "c":
         throughputs: list[float] = []
         for name in ("burst", "poisson", "constant"):
             profile = profiles.get(name)
@@ -335,30 +330,22 @@ def primary_metric(metrics: dict[str, Any], scenario: str) -> tuple[float, str |
             if not isinstance(req, (int, float)) or req <= 0:
                 return FAILURE_SCORE, "missing_request_throughput"
             throughputs.append(float(req))
-        product = 1.0
-        for value in throughputs:
-            product *= value
-        return product ** (1.0 / len(throughputs)), "geomean_request_throughput_req_per_s"
+        return math.prod(throughputs) ** (1.0 / len(throughputs)), "geomean_request_throughput_req_per_s"
 
-    if scenario == "inference_scenario_d_general":
+    if short == "d":
         ttft = _safe_p50(burst, "ttft")
         tpot = _safe_p50(burst, "tpot")
         req = burst.get("request_throughput_req_per_s")
-        if (
-            not ttft
-            or not tpot
-            or not isinstance(req, (int, float))
-            or ttft <= 0
-            or tpot <= 0
-            or req <= 0
-        ):
+        if not ttft or not tpot or not isinstance(req, (int, float)) or ttft <= 0 or tpot <= 0 or req <= 0:
             return FAILURE_SCORE, "missing_geomean_component"
-        return (1.0 / ttft * 1.0 / tpot * float(req)) ** (1.0 / 3.0), "geomean_inverse_latency_throughput"
+        return (1.0 / ttft / tpot * float(req)) ** (1.0 / 3.0), "geomean_inverse_latency_throughput"
 
     return FAILURE_SCORE, "unknown_scenario"
 
 
 def gate_passed(metrics: dict[str, Any]) -> bool:
+    if not speed_profiles_complete(metrics):
+        return False
     if metrics.get("error"):
         return False
     if metrics.get("score") == 0:
@@ -386,16 +373,7 @@ def _run_text(cmd: list[str], timeout_s: float = 20.0) -> str:
 
 
 def detect_engine_version(engine: str) -> str:
-    if engine == "vllm":
-        out = _run_text([sys.executable, "-c", "import vllm; print(vllm.__version__)"])
-        return out or "unknown"
-    if engine == "sglang":
-        out = _run_text([sys.executable, "-c", "import sglang; print(getattr(sglang, '__version__', 'unknown'))"])
-        return out or "unknown"
-    if engine == "tgi":
-        out = _run_text(["text-generation-launcher", "--version"])
-        return out or "unknown"
-    return "unknown"
+    return _run_text([sys.executable, "-c", f"import {engine}; print(getattr({engine}, '__version__', 'unknown'))"]) or "unknown"
 
 
 def harness_commit() -> dict[str, str | bool]:
@@ -405,19 +383,36 @@ def harness_commit() -> dict[str, str | bool]:
     return {"commit": rev or "unknown", "dirty": dirty}
 
 
-def ensure_dependency(import_name: str, pip_specs: list[str], auto_install: bool) -> None:
+def ensure_dependency(import_name: str, auto_install: bool, timeout_s: float) -> None:
+    if timeout_s <= 0:
+        raise BudgetExpired("budget exhausted before dependency installation")
+    requirements = _repo_root() / "containers/hpo-requirements.txt"
+    pins = dict(line.split("==", 1) for line in requirements.read_text().splitlines() if "==" in line)
+    expected = pins[import_name]
     try:
-        __import__(import_name)
-        return
-    except ImportError:
-        pass
+        installed = metadata.version(import_name)
+        if installed == expected:
+            __import__(import_name)
+            return
+    except (metadata.PackageNotFoundError, ImportError):
+        installed = "missing or not importable"
     if not auto_install:
         raise RuntimeError(
-            f"missing Python dependency '{import_name}'. "
-            f"Install {' '.join(pip_specs)} or rerun with --auto-install-deps."
+            f"{import_name}=={expected} is required; found {installed}. "
+            f"Install {requirements} or pass --auto-install-deps."
         )
-    print(f"[hpo] installing missing dependency for {import_name}: {' '.join(pip_specs)}", flush=True)
-    subprocess.run([sys.executable, "-m", "pip", "install", "--no-cache-dir", *pip_specs], check=True)
+    print(f"[hpo] installing pinned HPO dependencies from {requirements}", flush=True)
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir",
+             "--constraint", str(requirements.with_name("hpo-constraints.txt")), "-r", str(requirements)],
+            check=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BudgetExpired("budget exhausted during dependency installation") from exc
+    if metadata.version(import_name) != expected:
+        raise RuntimeError(f"dependency installation did not provide {import_name}=={expected}")
     __import__(import_name)
 
 
@@ -432,52 +427,23 @@ def build_engine_cmd(
     seed: int,
 ) -> list[str]:
     if engine == "vllm":
-        tokenizer_mode = _pb._vllm_tokenizer_mode(base_model)
         cmd = [
-            sys.executable,
-            "-u",
-            "-m",
-            "vllm.entrypoints.openai.api_server",
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--model",
-            base_model,
-            "--max-model-len",
-            str(max_model_len),
-            "--tokenizer-mode",
-            tokenizer_mode,
-            "--seed",
-            str(seed),
-        ]
-    elif engine == "sglang":
-        cmd = [
-            sys.executable,
-            "-u",
-            "-m",
-            "sglang.launch_server",
-            "--host",
-            host,
-            "--port",
-            str(port),
-            "--model-path",
-            base_model,
-            "--context-length",
-            str(max_model_len),
-        ]
-    elif engine == "tgi":
-        cmd = [
-            "text-generation-launcher",
-            "--model-id",
-            base_model,
-            "--hostname",
-            host,
-            "--port",
-            str(port),
+            sys.executable, "-u", "-m", "vllm.entrypoints.openai.api_server",
+            "--host", host,
+            "--port", str(port),
+            "--model", base_model,
+            "--max-model-len", str(max_model_len),
+            "--tokenizer-mode", _pb._vllm_tokenizer_mode(),
+            "--seed", str(seed),
         ]
     else:
-        raise ValueError(f"unsupported engine: {engine}")
+        cmd = [
+            sys.executable, "-u", "-m", "sglang.launch_server",
+            "--host", host,
+            "--port", str(port),
+            "--model-path", base_model,
+            "--context-length", str(max_model_len),
+        ]
 
     by_name = {p.name: p for p in params}
     for name, value in config.items():
@@ -502,7 +468,6 @@ def build_engine_cmd(
             continue
 
         if engine == "vllm" and name == "attention_backend":
-            # vLLM 0.11.0 selects this via VLLM_ATTENTION_BACKEND, not a CLI flag.
             continue
 
         if engine == "sglang" and name == "cuda_graph_max_bs":
@@ -552,8 +517,6 @@ def build_trial_env(engine: str, config: dict[str, Any], base_env: dict[str, str
         env["VLLM_ATTENTION_BACKEND"] = str(config["attention_backend"])
     if engine == "vllm":
         env.setdefault("VLLM_NO_USAGE_STATS", "1")
-    if engine == "sglang" and config.get("attention_backend"):
-        env["INFERENCE_BENCH_SGLANG_ATTENTION_BACKEND"] = str(config["attention_backend"])
     return env
 
 
@@ -579,45 +542,17 @@ def classify_start_failure(message: str) -> str:
     ]
     if any(p in text for p in resource_patterns):
         return "resource_exhausted"
-    if "timed out" in text or "not ready" in text:
-        return "server_start_failed"
     return "server_start_failed"
 
 
-def terminate_process_tree(proc: subprocess.Popen | None, timeout_s: float = 30.0) -> None:
-    if proc is None:
-        return
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except Exception:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
-    try:
-        proc.wait(timeout=timeout_s)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-    try:
-        proc.wait(timeout=timeout_s)
-    except Exception:
-        pass
-
-
 def _own_gpu_processes() -> list[tuple[int, float]]:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    devices = visible.split(",")
+    if not devices or any(not (device.isdigit() or device.startswith(("GPU-", "MIG-"))) for device in devices):
+        return []
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", f"--id={visible}", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
             check=False,
             capture_output=True,
             text=True,
@@ -649,24 +584,9 @@ def _own_gpu_processes() -> list[tuple[int, float]]:
     return out
 
 
-def verify_gpu_clean(threshold_mb: float, force_once: bool) -> tuple[bool, list[tuple[int, float]]]:
+def verify_gpu_clean(threshold_mb: float) -> tuple[bool, list[tuple[int, float]]]:
     procs = _own_gpu_processes()
     dirty = [(pid, mem) for pid, mem in procs if mem >= threshold_mb]
-    if not dirty or not force_once:
-        return (not dirty), dirty
-    for pid, _ in dirty:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except Exception:
-            pass
-    time.sleep(5)
-    for pid, _ in _own_gpu_processes():
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except Exception:
-            pass
-    time.sleep(5)
-    dirty = [(pid, mem) for pid, mem in _own_gpu_processes() if mem >= threshold_mb]
     return (not dirty), dirty
 
 
@@ -681,6 +601,7 @@ def run_scenario_eval(
     timeout_s: float,
 ) -> dict[str, Any]:
     out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.unlink(missing_ok=True)
     task_script = _repo_root() / "src" / "eval" / "tasks" / scenario / "evaluate.py"
     cmd = [
         sys.executable,
@@ -719,8 +640,22 @@ def run_scenario_eval(
         data = json.loads(out_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         return {"error": f"unparseable metrics json: {exc}", "wall_s": elapsed}
+    if not isinstance(data, dict):
+        return {"error": "metrics JSON must contain an object", "wall_s": elapsed}
     data.setdefault("wall_s", elapsed)
     return data
+
+
+def score_quick_metrics(metrics: dict[str, Any], scenario: str) -> tuple[float, str | None, list[str]]:
+    if "error" in metrics:
+        return FAILURE_SCORE, "quick_eval_failed", []
+    flags = integrity_flags(metrics)
+    if flags:
+        return FAILURE_SCORE, "integrity_failed", flags
+    metric, source = primary_metric(metrics, scenario)
+    if metric <= FAILURE_SCORE:
+        return FAILURE_SCORE, source or "metric_failed", flags
+    return metric, None, flags
 
 
 class HpoRunner:
@@ -745,28 +680,23 @@ class HpoRunner:
         self.trials: list[TrialResult] = []
         self._trial_counter = 0
 
-        runtime_cache_dir = Path(
-            os.environ.get(
-                "INFERENCE_BENCH_RUNTIME_CACHE_DIR",
-                str(_pb._default_runtime_cache_dir()),
-            )
-        )
+        runtime_cache_dir = Path(os.environ.get("INFERENCE_BENCH_RUNTIME_CACHE_DIR", str(_pb._default_runtime_cache_dir())))
         self.base_env = _pb._build_runtime_cache_env(runtime_cache_dir)
-        _pb._install_python_shims(runtime_cache_dir, self.base_env)
+        _pb._install_python_shims(self.base_env)
 
     def start_budget(self) -> None:
-        self.budget_start_s = time.time()
+        self.budget_start_s = time.monotonic()
         self.deadline_s = self.budget_start_s + float(self.args.budget_s)
 
     def budget_used_s(self) -> float:
         if self.budget_start_s is None:
             return 0.0
-        return max(0.0, time.time() - self.budget_start_s)
+        return max(0.0, time.monotonic() - self.budget_start_s)
 
     def budget_remaining_s(self) -> float:
         if self.deadline_s is None:
             return float(self.args.budget_s)
-        return max(0.0, self.deadline_s - time.time())
+        return max(0.0, self.deadline_s - time.monotonic())
 
     def allocate_trial_idx(self) -> int:
         idx = self._trial_counter
@@ -779,8 +709,8 @@ class HpoRunner:
             handle.flush()
 
     def run_start(self) -> None:
-        if self.args.overwrite and self.jsonl_path.exists():
-            self.jsonl_path.unlink()
+        with self.jsonl_path.open("w" if self.args.overwrite else "x", encoding="utf-8"):
+            pass
         self.append_record(
             {
                 "type": "run_start",
@@ -802,12 +732,52 @@ class HpoRunner:
             if self.best is None or result.quick_metric > self.best.quick_metric:
                 self.best = result
 
-    def _mock_metric(self, config: dict[str, Any]) -> float:
-        blob = json.dumps(config, sort_keys=True).encode("utf-8")
-        h = hashlib.sha256(blob).digest()
-        return 1.0 + int.from_bytes(h[:4], "big") / 2**32
+    def _server_spec(self, config: dict[str, Any], seed: int, skip_quality: bool) -> tuple[str, list[str], dict[str, str]]:
+        port = self.args.port or _pb._free_port()
+        cmd = build_engine_cmd(
+            self.args.engine, config, self.params, self.args.base_model,
+            self.args.host, port, self.args.max_model_len, seed,
+        )
+        env = build_trial_env(self.args.engine, config, self.base_env, skip_quality=skip_quality)
+        return f"http://{self.args.host}:{port}", cmd, env
+
+    @contextlib.contextmanager
+    def _running_server(
+        self,
+        server_url: str,
+        cmd: list[str],
+        env: dict[str, str],
+        log_path: Path,
+        start_timeout_s: float,
+        phase_times: dict[str, float],
+    ):
+        proc: subprocess.Popen | None = None
+        t0 = time.time()
+        try:
+            proc = _pb._start_server(cmd, log_path=log_path, env=env)
+            _pb._wait_ready(
+                server_url,
+                timeout_s=start_timeout_s,
+                proc=proc,
+                log_path=log_path,
+                base_model=self.args.base_model,
+                initial_delay_s=self.args.server_initial_delay_s,
+            )
+            phase_times["server_start_s"] = time.time() - t0
+            yield
+        finally:
+            t1 = time.time()
+            _pb._stop_server(proc, 30.0)
+            phase_times["teardown_s"] = time.time() - t1
+
+    def _dirty_gpu(self) -> list[tuple[int, float]]:
+        if self.args.skip_gpu_clean_check:
+            return []
+        return verify_gpu_clean(self.args.gpu_clean_threshold_mb)[1]
 
     def run_trial(self, config: dict[str, Any], trial_idx: int) -> float:
+        if self.budget_remaining_s() <= 1:
+            raise BudgetExpired("budget exhausted before trial launch")
         if self.args.max_trials is not None and len(self.trials) >= self.args.max_trials:
             raise BudgetExpired("max_trials reached")
 
@@ -815,134 +785,49 @@ class HpoRunner:
         trial_dir.mkdir(parents=True, exist_ok=True)
         launch_ts = _utc_now()
         eval_ts: str | None = None
-        teardown_ts: str | None = None
-        server_url: str | None = None
-        cmd: list[str] | None = None
-        metrics: dict[str, Any] | None = None
         metrics_path: Path | None = None
-        proc: subprocess.Popen | None = None
         failure_reason: str | None = None
         metric = FAILURE_SCORE
         flags: list[str] = []
         phase_times: dict[str, float] = {}
 
-        if self.args.mock:
-            metric = self._mock_metric(config)
-            metrics_path = trial_dir / "quick_metrics.json"
-            metrics_path.write_text(
-                json.dumps({"mock": True, "quick_metric": metric, "profiles": {}}, indent=2),
-                encoding="utf-8",
-            )
-            teardown_ts = _utc_now()
-            result = TrialResult(trial_idx, config, metric, None, str(metrics_path), flags)
-            self._record_trial_result(result)
-            self.append_record(
-                {
-                    "type": "trial",
-                    "trial_idx": trial_idx,
-                    "config": config,
-                    "quick_metric": metric,
-                    "quick_metric_source": "mock",
-                    "failure_reason": None,
-                    "launch_ts": launch_ts,
-                    "eval_ts": launch_ts,
-                    "teardown_ts": teardown_ts,
-                    "cmd": ["mock"],
-                    "metrics_path": str(metrics_path),
-                    "phase_times_s": phase_times,
-                }
-            )
-            return metric
-
-        if self.budget_remaining_s() <= 1:
-            raise BudgetExpired("budget exhausted before trial launch")
-
-        port = self.args.port if self.args.port else _pb._free_port()
-        server_url = f"http://{self.args.host}:{port}"
-        cmd = build_engine_cmd(
-            self.args.engine,
-            config,
-            self.params,
-            self.args.base_model,
-            self.args.host,
-            port,
-            self.args.max_model_len,
-            self.args.seed_dev,
-        )
-        env = build_trial_env(self.args.engine, config, self.base_env, skip_quality=True)
-        server_log = trial_dir / "server.log"
-
+        server_url, cmd, env = self._server_spec(config, self.args.seed_dev, skip_quality=True)
+        start_timeout = self.args.first_server_start_timeout_s if trial_idx == 0 else self.args.server_start_timeout_s
         try:
             print(f"[hpo] trial={trial_idx} config={config}", flush=True)
             print(f"[hpo] trial={trial_idx} cmd={' '.join(shlex.quote(c) for c in cmd)}", flush=True)
-            t0 = time.time()
-            proc = _pb._start_server(cmd, log_path=server_log, env=env)
-            start_timeout = self.args.first_server_start_timeout_s if trial_idx == 0 else self.args.server_start_timeout_s
-            _pb._wait_ready(
-                server_url,
-                timeout_s=min(start_timeout, max(1.0, self.budget_remaining_s())),
-                proc=proc,
-                log_path=server_log,
-                base_model=self.args.base_model,
-                initial_delay_s=self.args.server_initial_delay_s,
-            )
-            phase_times["server_start_s"] = time.time() - t0
-
-            if self.budget_remaining_s() <= 1:
-                failure_reason = "budget_expired"
-                raise BudgetExpired("budget expired before quick eval")
-
-            eval_ts = _utc_now()
-            metrics_path = trial_dir / "quick_metrics.json"
-            t1 = time.time()
-            metrics = run_scenario_eval(
-                self.args.scenario,
-                server_url,
-                self.args.base_model,
-                self.args.seed_dev,
-                metrics_path,
-                env,
-                quick=True,
-                timeout_s=min(self.args.quick_eval_timeout_s, max(1.0, self.budget_remaining_s())),
-            )
-            phase_times["quick_eval_s"] = time.time() - t1
-
-            if "error" in metrics:
-                failure_reason = "quick_eval_failed"
-            else:
-                flags = integrity_flags(metrics)
-                if flags:
-                    failure_reason = "integrity_failed"
-                if failure_reason is None:
-                    metric, source = primary_metric(metrics, self.args.scenario)
-                    if metric <= FAILURE_SCORE:
-                        failure_reason = source or "metric_failed"
-                        metric = FAILURE_SCORE
-                else:
-                    source = None
-            if failure_reason is not None:
-                metric = FAILURE_SCORE
-
+            with self._running_server(
+                server_url, cmd, env, trial_dir / "server.log",
+                min(start_timeout, max(1.0, self.budget_remaining_s())), phase_times,
+            ):
+                if self.budget_remaining_s() <= 1:
+                    raise BudgetExpired("budget expired before quick eval")
+                eval_ts = _utc_now()
+                metrics_path = trial_dir / "quick_metrics.json"
+                t1 = time.time()
+                metrics = run_scenario_eval(
+                    self.args.scenario,
+                    server_url,
+                    self.args.base_model,
+                    self.args.seed_dev,
+                    metrics_path,
+                    env,
+                    quick=True,
+                    timeout_s=min(self.args.quick_eval_timeout_s, max(1.0, self.budget_remaining_s())),
+                )
+                phase_times["quick_eval_s"] = time.time() - t1
+            metric, failure_reason, flags = score_quick_metrics(metrics, self.args.scenario)
         except BudgetExpired:
-            failure_reason = failure_reason or "budget_expired"
-            metric = FAILURE_SCORE
+            failure_reason = "budget_expired"
         except (RuntimeError, TimeoutError) as exc:
             failure_reason = classify_start_failure(str(exc))
-            metric = FAILURE_SCORE
         except Exception as exc:
             failure_reason = f"unexpected_error:{type(exc).__name__}"
             (trial_dir / "unexpected_error.txt").write_text(str(exc), encoding="utf-8")
-            metric = FAILURE_SCORE
-        finally:
-            t2 = time.time()
-            terminate_process_tree(proc)
-            teardown_ts = _utc_now()
-            phase_times["teardown_s"] = time.time() - t2
-
-            if not self.args.skip_gpu_clean_check:
-                clean, dirty = verify_gpu_clean(self.args.gpu_clean_threshold_mb, force_once=True)
-                if not clean:
-                    raise AbortRun(f"GPU still dirty after teardown: {dirty}")
+        teardown_ts = _utc_now()
+        dirty = self._dirty_gpu()
+        if dirty:
+            failure_reason, metric = "gpu_cleanup_failed", FAILURE_SCORE
 
         result = TrialResult(
             trial_idx=trial_idx,
@@ -970,6 +855,8 @@ class HpoRunner:
                 "phase_times_s": phase_times,
             }
         )
+        if dirty:
+            raise AbortRun(f"GPU still dirty after teardown: {dirty}")
         return float(metric)
 
     def run_final(self) -> dict[str, Any]:
@@ -985,77 +872,27 @@ class HpoRunner:
 
         final_dir = self.artifact_root / "final"
         final_dir.mkdir(parents=True, exist_ok=True)
-        if self.args.mock:
-            metrics = {
-                "mock": True,
-                "profiles": {
-                    "burst": {
-                        "request_count": 4,
-                        "success_count": 4,
-                        "ttft": {"p50": 1.0 / best.quick_metric, "p90": None, "p99": None},
-                        "tpot": {"p50": 1.0 / best.quick_metric, "p90": None, "p99": None},
-                        "request_throughput_req_per_s": best.quick_metric,
-                        "generation_throughput_tokens_per_s": best.quick_metric,
-                    }
-                },
-                "quality_check": {"pass": True, "note": "mock mode"},
-            }
-            (final_dir / "final_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-            return {
-                "best_trial_idx": best.trial_idx,
-                "final_config": best.config,
-                "final_metrics": metrics,
-                "final_primary_metric": best.quick_metric,
-                "final_primary_metric_source": "mock",
-                "gate_passed": True,
-                "integrity_passed": True,
-                "integrity_flags": [],
-            }
-
-        port = self.args.port if self.args.port else _pb._free_port()
-        server_url = f"http://{self.args.host}:{port}"
-        cmd = build_engine_cmd(
-            self.args.engine,
-            best.config,
-            self.params,
-            self.args.base_model,
-            self.args.host,
-            port,
-            self.args.max_model_len,
-            self.args.seed_eval,
-        )
-        env = build_trial_env(self.args.engine, best.config, self.base_env, skip_quality=False)
+        server_url, cmd, env = self._server_spec(best.config, self.args.seed_eval, skip_quality=False)
         env["INFERENCE_BENCH_QUALITY_SEED"] = str(self.args.quality_seed)
-        server_log = final_dir / "server.log"
-        proc: subprocess.Popen | None = None
+        print(f"[hpo] final best_trial={best.trial_idx} config={best.config}", flush=True)
         try:
-            print(f"[hpo] final best_trial={best.trial_idx} config={best.config}", flush=True)
-            proc = _pb._start_server(cmd, log_path=server_log, env=env)
-            _pb._wait_ready(
-                server_url,
-                timeout_s=self.args.final_server_start_timeout_s,
-                proc=proc,
-                log_path=server_log,
-                base_model=self.args.base_model,
-                initial_delay_s=self.args.server_initial_delay_s,
-            )
-            metrics_path = final_dir / "final_metrics.json"
-            metrics = run_scenario_eval(
-                self.args.scenario,
-                server_url,
-                self.args.base_model,
-                self.args.seed_eval,
-                metrics_path,
-                env,
-                quick=False,
-                timeout_s=self.args.final_eval_timeout_s,
-            )
+            with self._running_server(
+                server_url, cmd, env, final_dir / "server.log", self.args.final_server_start_timeout_s, {},
+            ):
+                metrics = run_scenario_eval(
+                    self.args.scenario,
+                    server_url,
+                    self.args.base_model,
+                    self.args.seed_eval,
+                    final_dir / "final_metrics.json",
+                    env,
+                    quick=False,
+                    timeout_s=self.args.final_eval_timeout_s,
+                )
         finally:
-            terminate_process_tree(proc)
-            if not self.args.skip_gpu_clean_check:
-                clean, dirty = verify_gpu_clean(self.args.gpu_clean_threshold_mb, force_once=True)
-                if not clean:
-                    raise AbortRun(f"GPU still dirty after final teardown: {dirty}")
+            dirty = self._dirty_gpu()
+            if dirty:
+                raise AbortRun(f"GPU still dirty after final teardown: {dirty}")
 
         metric, source = primary_metric(metrics, self.args.scenario)
         flags = integrity_flags(metrics)
@@ -1066,7 +903,7 @@ class HpoRunner:
             "final_primary_metric": metric,
             "final_primary_metric_source": source,
             "gate_passed": gate_passed(metrics),
-            "integrity_passed": not flags,
+            "integrity_passed": not flags and speed_profiles_complete(metrics),
             "integrity_flags": flags,
             "final_cmd": cmd,
         }
@@ -1077,35 +914,30 @@ def run_random_search(runner: HpoRunner, params: list[SearchParam]) -> None:
     fixed, tunable = split_fixed_params(params)
     max_unique = search_space_size(tunable)
     tried: set[tuple[tuple[str, str], ...]] = set()
-    while runner.budget_remaining_s() > 0:
+    while runner.budget_remaining_s() > 0 and len(tried) < max_unique:
         if runner.args.max_trials is not None and len(runner.trials) >= runner.args.max_trials:
             break
-        if len(tried) >= max_unique:
-            break
-        while True:
-            config = {**fixed, **sample_uniform(tunable, rng)}
-            key = config_to_hashable(config)
-            if key not in tried:
-                tried.add(key)
-                break
-        idx = runner.allocate_trial_idx()
+        config = {**fixed, **sample_uniform(tunable, rng)}
+        key = config_to_hashable(config)
+        if key in tried:
+            continue
+        tried.add(key)
         try:
-            runner.run_trial(config, idx)
+            runner.run_trial(config, runner.allocate_trial_idx())
         except BudgetExpired:
             break
 
 
 def run_optuna_tpe(runner: HpoRunner, params: list[SearchParam]) -> None:
-    ensure_dependency("optuna", ["optuna"], runner.args.auto_install_deps)
-    import optuna  # type: ignore
+    try:
+        ensure_dependency("optuna", runner.args.auto_install_deps, runner.budget_remaining_s())
+    except BudgetExpired:
+        return
+    import optuna
 
     fixed, tunable = split_fixed_params(params)
     if not tunable:
-        try:
-            runner.run_trial(dict(fixed), runner.allocate_trial_idx())
-        except BudgetExpired:
-            pass
-        return
+        return run_random_search(runner, params)
 
     study = optuna.create_study(
         direction="maximize",
@@ -1122,49 +954,33 @@ def run_optuna_tpe(runner: HpoRunner, params: list[SearchParam]) -> None:
         try:
             return runner.run_trial(config, idx)
         except BudgetExpired:
+            study.stop()
             return FAILURE_SCORE
 
-    n_trials = runner.args.max_trials
-    study.optimize(objective, timeout=runner.args.budget_s, n_trials=n_trials, show_progress_bar=False)
+    remaining = runner.budget_remaining_s()
+    if remaining > 0:
+        study.optimize(objective, timeout=remaining, n_trials=runner.args.max_trials, show_progress_bar=False)
 
 
 def run_smac(runner: HpoRunner, params: list[SearchParam]) -> None:
-    ensure_dependency("smac", ["smac", "ConfigSpace"], runner.args.auto_install_deps)
-    ensure_dependency("ConfigSpace", ["ConfigSpace"], runner.args.auto_install_deps)
-
-    from ConfigSpace import ConfigurationSpace  # type: ignore
-
     try:
-        from ConfigSpace import Categorical  # type: ignore
+        ensure_dependency("ConfigSpace", runner.args.auto_install_deps, runner.budget_remaining_s())
+        ensure_dependency("smac", runner.args.auto_install_deps, runner.budget_remaining_s())
+    except BudgetExpired:
+        return
 
-        def make_cat(name: str, choices: list[str]) -> Any:
-            return Categorical(name, choices)
-
-    except ImportError:
-        from ConfigSpace.hyperparameters import CategoricalHyperparameter  # type: ignore
-
-        def make_cat(name: str, choices: list[str]) -> Any:
-            return CategoricalHyperparameter(name, choices)
-
-    from smac import HyperparameterOptimizationFacade as HPO  # type: ignore
-    from smac import Scenario  # type: ignore
-    try:
-        from smac.main.exceptions import ConfigurationSpaceExhaustedException  # type: ignore
-    except Exception:
-        ConfigurationSpaceExhaustedException = None  # type: ignore
+    from ConfigSpace import Categorical, ConfigurationSpace
+    from smac import HyperparameterOptimizationFacade as HPO
+    from smac import Scenario
+    from smac.main.exceptions import ConfigurationSpaceExhaustedException
 
     fixed, tunable = split_fixed_params(params)
     if not tunable:
-        try:
-            runner.run_trial(dict(fixed), runner.allocate_trial_idx())
-        except BudgetExpired:
-            pass
-        return
+        return run_random_search(runner, params)
 
-    encoded_values = {p.name: [json.dumps(_jsonable(v), sort_keys=True) for v in p.values] for p in tunable}
     cs = ConfigurationSpace(seed=runner.args.seed_dev)
     for p in tunable:
-        cs.add_hyperparameter(make_cat(p.name, encoded_values[p.name]))
+        cs.add(Categorical(p.name, [json.dumps(_jsonable(v), sort_keys=True) for v in p.values]))
 
     def objective(config: Any, seed: int = 0) -> float:
         decoded = dict(fixed)
@@ -1175,32 +991,25 @@ def run_smac(runner: HpoRunner, params: list[SearchParam]) -> None:
         except BudgetExpired:
             return -FAILURE_SCORE
 
-    scenario_kwargs = {
-        "deterministic": False,
-        "n_trials": runner.args.max_trials or 10000,
-        "walltime_limit": float(runner.args.budget_s),
-        "output_directory": str(runner.artifact_root / "smac3"),
-    }
-    try:
-        scenario = Scenario(cs, **scenario_kwargs)
-    except TypeError:
-        scenario_kwargs.pop("output_directory", None)
-        try:
-            scenario = Scenario(cs, **scenario_kwargs)
-        except TypeError:
-            scenario_kwargs.pop("walltime_limit", None)
-            scenario = Scenario(cs, **scenario_kwargs)
+    remaining = runner.budget_remaining_s()
+    if remaining <= 0:
+        return
+    scenario = Scenario(
+        cs,
+        deterministic=False,
+        n_trials=runner.args.max_trials or 10000,
+        walltime_limit=remaining,
+        output_directory=runner.artifact_root / "smac3",
+        seed=runner.args.seed_dev,
+    )
     smac = HPO(scenario, objective, overwrite=True)
     try:
         smac.optimize()
-    except Exception as exc:
-        if (
-            ConfigurationSpaceExhaustedException is not None
-            and isinstance(exc, ConfigurationSpaceExhaustedException)
-        ) or type(exc).__name__ == "ConfigurationSpaceExhaustedException":
-            print("[hpo] SMAC search space exhausted; proceeding to final evaluation.", flush=True)
-            return
-        raise
+    except ConfigurationSpaceExhaustedException:
+        print("[hpo] SMAC search space exhausted", flush=True)
+
+
+SEARCHES = {"random": run_random_search, "tpe": run_optuna_tpe, "smac": run_smac}
 
 
 def default_out_root() -> Path:
@@ -1211,90 +1020,71 @@ def default_out_root() -> Path:
     return Path(results) / "hpo_search_baselines"
 
 
+def _env(name: str, cast: Any, default: Any = None) -> Any:
+    raw = os.environ.get(name, "").strip()
+    if raw and raw != "UNDEFINED":
+        try:
+            return cast(raw)
+        except ValueError:
+            pass
+    return default
+
+
 def build_parser() -> argparse.ArgumentParser:
-    def env_float(name: str, default: float) -> float:
-        raw = os.environ.get(name, "").strip()
-        if not raw or raw == "UNDEFINED":
-            return default
-        try:
-            return float(raw)
-        except ValueError:
-            return default
-
-    def env_int(name: str, default: int) -> int:
-        raw = os.environ.get(name, "").strip()
-        if not raw or raw == "UNDEFINED":
-            return default
-        try:
-            return int(raw)
-        except ValueError:
-            return default
-
-    def env_optional_int(name: str) -> int | None:
-        raw = os.environ.get(name, "").strip()
-        if not raw or raw == "UNDEFINED":
-            return None
-        try:
-            return int(raw)
-        except ValueError:
-            return None
-
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description="Run random, TPE, or SMAC inference search baselines.")
     parser.add_argument("--method", choices=["random", "tpe", "smac"], required=True)
-    parser.add_argument("--engine", choices=["vllm", "sglang", "tgi"], required=True)
+    parser.add_argument("--engine", choices=["vllm", "sglang"], required=True)
     parser.add_argument("--scenario", required=True, help="a/b/c/d or full scenario directory name")
     parser.add_argument("--seed-id", type=int, default=0)
-    parser.add_argument("--seed-dev", type=int, default=env_int("HPO_BASELINE_SEED_DEV", 21))
-    parser.add_argument("--seed-eval", type=int, default=env_int("HPO_BASELINE_SEED_EVAL", 1337))
-    parser.add_argument("--quality-seed", type=int, default=env_int("HPO_BASELINE_QUALITY_SEED", 248))
+    parser.add_argument("--seed-dev", type=int, default=_env("HPO_BASELINE_SEED_DEV", int, 21))
+    parser.add_argument("--seed-eval", type=int, default=_env("HPO_BASELINE_SEED_EVAL", int, 1337))
+    parser.add_argument("--quality-seed", type=int, default=_env("HPO_BASELINE_QUALITY_SEED", int, _env("INFERENCE_BENCH_QUALITY_SEED", int, DEFAULT_SEED)))
     parser.add_argument("--base-model", default=os.environ.get("INFERENCE_BENCH_BASE_MODEL", "mistralai/Mistral-7B-Instruct-v0.3"))
     parser.add_argument("--max-model-len", default=os.environ.get("INFERENCE_BENCH_MAX_MODEL_LEN", "32768"))
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=0, help="0 = choose a free port per trial")
+    parser.add_argument("--port", type=int, default=0, help="0 chooses a free port for each trial.")
     parser.add_argument("--out-root", type=Path, default=default_out_root())
     parser.add_argument("--search-space", type=Path, default=None)
-    parser.add_argument("--budget-s", type=float, default=env_float("HPO_BASELINE_BUDGET_S", 7200.0))
-    parser.add_argument("--quick-eval-timeout-s", type=float, default=env_float("HPO_BASELINE_QUICK_EVAL_TIMEOUT_S", 180.0))
-    parser.add_argument(
-        "--server-start-timeout-s",
-        type=float,
-        default=env_float("HPO_BASELINE_SERVER_START_TIMEOUT_S", 300.0),
-    )
-    parser.add_argument(
-        "--first-server-start-timeout-s",
-        type=float,
-        default=env_float("HPO_BASELINE_FIRST_SERVER_START_TIMEOUT_S", 360.0),
-    )
-    parser.add_argument("--final-server-start-timeout-s", type=float, default=env_float("HPO_BASELINE_FINAL_SERVER_START_TIMEOUT_S", 600.0))
-    parser.add_argument(
-        "--server-initial-delay-s",
-        type=float,
-        default=env_float("HPO_BASELINE_SERVER_INITIAL_DELAY_S", 60.0),
-    )
-    parser.add_argument("--final-eval-timeout-s", type=float, default=env_float("HPO_BASELINE_FINAL_EVAL_TIMEOUT_S", 7200.0))
-    parser.add_argument("--gpu-clean-threshold-mb", type=float, default=env_float("HPO_BASELINE_GPU_CLEAN_THRESHOLD_MB", 1024.0))
+    parser.add_argument("--budget-s", type=float, default=_env("HPO_BASELINE_BUDGET_S", float, 7200.0))
+    parser.add_argument("--quick-eval-timeout-s", type=float, default=_env("HPO_BASELINE_QUICK_EVAL_TIMEOUT_S", float, 180.0))
+    parser.add_argument("--server-start-timeout-s", type=float, default=_env("HPO_BASELINE_SERVER_START_TIMEOUT_S", float, 300.0))
+    parser.add_argument("--first-server-start-timeout-s", type=float, default=_env("HPO_BASELINE_FIRST_SERVER_START_TIMEOUT_S", float, 360.0))
+    parser.add_argument("--final-server-start-timeout-s", type=float, default=_env("HPO_BASELINE_FINAL_SERVER_START_TIMEOUT_S", float, 600.0))
+    parser.add_argument("--server-initial-delay-s", type=float, default=_env("HPO_BASELINE_SERVER_INITIAL_DELAY_S", float, 60.0))
+    parser.add_argument("--final-eval-timeout-s", type=float, default=_env("HPO_BASELINE_FINAL_EVAL_TIMEOUT_S", float, 7200.0))
+    parser.add_argument("--gpu-clean-threshold-mb", type=float, default=_env("HPO_BASELINE_GPU_CLEAN_THRESHOLD_MB", float, 1024.0))
     parser.add_argument("--skip-gpu-clean-check", action="store_true")
-    parser.add_argument("--auto-install-deps", action="store_true", default=os.environ.get("HPO_BASELINE_AUTO_INSTALL_DEPS", "1") != "0")
-    parser.add_argument(
-        "--max-trials",
-        type=int,
-        default=env_optional_int("HPO_BASELINE_MAX_TRIALS"),
-        help="Testing/debug cap; wall clock remains authoritative.",
-    )
+    parser.add_argument("--auto-install-deps", action="store_true", default=os.environ.get("HPO_BASELINE_AUTO_INSTALL_DEPS", "0") == "1")
+    parser.add_argument("--max-trials", type=int, default=_env("HPO_BASELINE_MAX_TRIALS", int))
     parser.add_argument("--overwrite", action="store_true", default=os.environ.get("HPO_BASELINE_OVERWRITE", "0") == "1")
     parser.add_argument(
         "--allow-unsafe-search-space",
         action="store_true",
         default=os.environ.get("HPO_BASELINE_ALLOW_UNSAFE_SEARCH_SPACE", "0") == "1",
-        help="Bypass SGLang safety checks for explicit canary/debug runs.",
+        help="Skip the SGLang search-space safety checks.",
     )
-    parser.add_argument("--mock", action="store_true", default=os.environ.get("INFERENCE_BENCH_MOCK", "").lower() in {"1", "true", "yes"})
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    for name in (
+        "budget_s", "quick_eval_timeout_s", "server_start_timeout_s",
+        "first_server_start_timeout_s", "final_server_start_timeout_s",
+        "final_eval_timeout_s", "gpu_clean_threshold_mb",
+    ):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be finite and positive")
+    if not math.isfinite(args.server_initial_delay_s) or args.server_initial_delay_s < 0:
+        parser.error("--server-initial-delay-s must be finite and nonnegative")
+    if args.max_trials is not None and args.max_trials < 1:
+        parser.error("--max-trials must be positive")
+    if args.seed_id < 0:
+        parser.error("--seed-id must be nonnegative")
+    if not 0 <= args.port <= 65535:
+        parser.error("--port must be between 0 and 65535")
     args.scenario = normalize_scenario(args.scenario)
 
     space_raw, params = load_search_space(args.engine, args.search_space)
@@ -1302,6 +1092,7 @@ def main() -> None:
         args.engine,
         params,
         allow_unsafe=args.allow_unsafe_search_space,
+        max_model_len=int(args.max_model_len),
     )
     scenario_short = SCENARIO_TO_SHORT[args.scenario]
     jsonl_path = args.out_root / args.method / args.engine / f"scenario_{scenario_short}" / f"seed_{args.seed_id}.jsonl"
@@ -1312,14 +1103,7 @@ def main() -> None:
     runner.start_budget()
 
     try:
-        if args.method == "random":
-            run_random_search(runner, params)
-        elif args.method == "tpe":
-            run_optuna_tpe(runner, params)
-        elif args.method == "smac":
-            run_smac(runner, params)
-        else:
-            raise ValueError(args.method)
+        SEARCHES[args.method](runner, params)
         budget_used = runner.budget_used_s()
         final = runner.run_final()
         runner.append_record(
@@ -1331,7 +1115,7 @@ def main() -> None:
                 "end_ts": _utc_now(),
             }
         )
-    except AbortRun as exc:
+    except Exception as exc:
         runner.append_record(
             {
                 "type": "run_abort",

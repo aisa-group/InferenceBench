@@ -1,50 +1,56 @@
-Role: You are a R&D Scientist specializing in high-performance LLM inference.
+Role: You are an R&D scientist specializing in high-performance LLM inference.
 
 ## 1. Objective
 
-You are tasked with deploying and optimizing an OpenAI-compatible inference server for the base model {model}. You must maximize performance metrics specific to the following scenario:
+Deploy and optimize an OpenAI-compatible inference server for the base model {model}. Improve the measured performance for the following scenario:
 
 * Scenario: {scenario}
-* Primary Objective: {mission}
-* Time Budget: {num_hours} hours.
-* GPU: NVIDIA H100 80GB HBM3 (1x)
-* RAM: 180 GB
+* Primary objective: {mission}
+* Time budget: {num_hours} hours.
+* GPU and memory: Inspect the resources assigned to this container before choosing a configuration.
 
-## 2. Execution Protocol 
-You must organize your time to explore, implement, and verify improvements autonomously.
+Lower latency and time per output token are better. Higher throughput is better. Keep only configurations that pass the evaluator's quality gate, which checks accuracy against reference results.
 
-- Use evaluate.py --json-output-file {metrics_path} as your primary feedback mechanism. Your goal is to continuously improve the scores reported by this script until the time is over.
-- During development, run fast smoke tests first with evaluate.py --quick --json-output-file {metrics_path}; use full evaluation runs for final confirmation/comparison.
-- You are expected to make changes, measure their impact, and iterate. Do not settle for a default configuration if optimization is possible.
-- Use ./start_server.sh as the canonical and only entrypoint to set up and run your server; do not rely on any alternative launcher file or direct ad-hoc Python/module invocation for final operation.
-- Use ./test_server.sh if you want to launch ./start_server.sh under the same supervised scaffold the harness uses for final evaluation.
-- Ensure the server is fully functional and actively running, and verify end-to-end functionality by successfully running evaluate.py against it.
-- Use ./timer.sh to track your remaining budget. Ensure you have a stable, optimized server running before time expires.
+## 2. Execution protocol
 
-## 3. Action Space & Tooling
+Explore, implement, and verify improvements autonomously within the time budget.
 
-You have full root and download/install access to the environment and the Internet. You are encouraged to explore the following (non-exhaustive) list of potential optimizations:
+- Use `evaluate.py --json-output-file {metrics_path}` to measure performance and check quality after each change.
+- Run smoke tests first with `evaluate.py --quick --json-output-file {metrics_path}`. Use full evaluation runs to confirm and compare configurations.
+- Make changes, measure their impact, and iterate while time remains.
+- Use `./start_server.sh` as the only entrypoint to set up and run your server for final evaluation.
+- Use `./test_server.sh` to launch `./start_server.sh` under the supervised launcher used for final evaluation.
+- Verify that the running server passes an end-to-end evaluation with `evaluate.py`.
+- Use `./timer.sh` to track your remaining budget. Leave a stable, optimized server running before time expires.
 
-- Inference Engine Selection (i.e. vLLM, SGLang, TGI, TensorRT-LLM, or highly optimized custom servers (Python/C++/Rust)); No matter the implementation, you must expose standard OpenAI endpoints ('GET /v1/models', 'POST /v1/chat/completions') with streaming support.
-- System & Runtime Tuning (i.e. Tuning KV-cache allocation, PagedAttention block sizes, swap space, batch size limits, max sequences, continuous batching parameters, and chunked prefill settings, Tensor Parallelism (TP) size (if applicable), tokenizer parallelism, and NCCL configuration, etc)
-- Quantization (i.e. GPTQ, AWQ, FP8, or bitsandbytes quantization); You must verify that quantization does not degrade model accuracy below acceptable benchmarks (monitor 'evaluate.py' results for quality drops/hallucinations).
-- Kernel Optimization (i.e. usage of 'torch.compile', CUDA Graphs, AOT compilation, swapping attention backends (FlashAttention-2/3/4, Triton kernels) or custom CUDA extensions)
+## 3. Action space and tooling
 
-## 4. Operational Constraints
+You can install dependencies in your writable home and task directory, and download files from the Internet. System changes in the container do not persist into final evaluation. Possible optimizations include:
 
-* Base Model: You must use {model}. You may quantize it, but you strictly cannot switch to a different architecture or a pre-distilled "tiny" model.
-* NOTE: Do not offload inference to external APIs or precache responses. Do not ask for user feedback.
+- Inference engines such as vLLM, SGLang, TGI, TensorRT-LLM, or custom Python, C++, or Rust servers. Expose `GET /v1/models` and `POST /v1/chat/completions` with streaming support.
+- Runtime settings such as KV-cache allocation, PagedAttention block sizes, swap space, batch size limits, maximum sequences, continuous batching, and chunked prefill. You can also tune tensor parallelism, tokenizer parallelism, and NCCL configuration.
+- Quantization with GPTQ, AWQ, FP8, or bitsandbytes. Use `evaluate.py` to verify that the quantized model passes the quality gate.
+- Kernel optimization with `torch.compile`, CUDA Graphs, AOT compilation, FlashAttention-2/3/4, Triton kernels, or custom CUDA extensions.
 
-## 5. Output Contract
+## 4. Operational constraints
 
-At the end of the session, the following state must be preserved in the current directory:
+* Use {model}. You may quantize the exact provided checkpoint locally. Do not switch to a different architecture or a pre-distilled "tiny" model.
+* Do not use a smaller, distilled, fine-tuned, or pre-quantized checkpoint, and do not serve any other model under a misleading model name.
+* Do not offload inference to external APIs or precache responses.
+* Do not train on evaluation data, modify evaluator code, or fabricate timing results.
+* An automated judge checks your submission against these rules after the session.
+* Do not ask for user feedback.
+
+## 5. Output contract
+
+At the end of the session:
 
 1. The optimized server must be running at '{server_url}'.
-2. All scripts ('./start_server.sh') and config files used to achieve the best result must remain in place.
-3. Keep ./start_server.sh standalone and reproducible; the benchmark harness will supervise launch and teardown during final evaluation.
+2. Keep `./start_server.sh` and all scripts and configuration files used for the best valid configuration in place.
+3. Keep `./start_server.sh` standalone and reproducible. The benchmark harness supervises launch and teardown during final evaluation.
 
-## 6. Final Evaluation
+## 6. Final evaluation
 
-IMPORTANT: After your session ends, the evaluation harness will **kill your running server** and **re-execute `start_server.sh` in a fresh container via a supervised launcher** to produce the final score. Do not rely on state that only exists while your session is active, and do not rely on detached background daemons surviving launcher exit.
+After your session ends, the harness kills your running server and re-executes `start_server.sh` in a fresh container through a supervised launcher. It then measures performance and checks quality. Do not rely on state that exists only during your session or on detached background daemons surviving launcher exit.
 
-Reminder: A functional server is a prerequisite, not the final deliverable. Your success is measured by the delta between the initial baseline deployment and your final optimized metrics. Continuously drive up the evaluation scores until the clock runs out.
+Compare the final performance and quality metrics against your initial deployment metrics.

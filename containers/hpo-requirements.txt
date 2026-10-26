@@ -1,0 +1,3 @@
+optuna==4.9.0
+smac==2.4.1
+ConfigSpace==1.2.2

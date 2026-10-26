@@ -11,27 +11,14 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import numpy as np
 import requests
 
-# Lazy-import transformers to avoid triggering the accelerate circular import
-# (accelerate.big_modeling -> hooks -> utils.bnb -> big_modeling) at module-load
-# time inside containers with mismatched package paths.
-AutoConfig = None   # type: ignore[assignment]
-AutoTokenizer = None  # type: ignore[assignment]
-
-
-def _ensure_transformers() -> None:
-    global AutoConfig, AutoTokenizer
-    if AutoConfig is None:
-        from transformers import AutoConfig as _AC, AutoTokenizer as _AT
-        AutoConfig = _AC
-        AutoTokenizer = _AT
-
 from . import quality_gate
+from .quality_gate import DEFAULT_SEED, env_float, env_int
 
 
 def _read_text(path: Path) -> str:
@@ -44,17 +31,13 @@ def load_scenario_config(task_dir: Path) -> Dict[str, Any]:
     mission_path = task_dir / "mission.txt"
     if mission_path.exists():
         config["mission"] = _read_text(mission_path)
-    if "dataset_seed" not in config or config.get("dataset_seed") in (None, ""):
-        seed_env = os.environ.get("INFERENCE_BENCH_DATASET_SEED", "").strip()
-        try:
-            config["dataset_seed"] = int(seed_env) if seed_env else 248
-        except ValueError:
-            config["dataset_seed"] = 248
+    if config.get("dataset_seed") in (None, ""):
+        config["dataset_seed"] = env_int("INFERENCE_BENCH_DATASET_SEED", DEFAULT_SEED)
     config["task_dir"] = str(task_dir)
     return config
 
 
-def _count_chat_tokens(messages: List[Dict[str, str]], tokenizer: AutoTokenizer) -> int:
+def _count_chat_tokens(messages: List[Dict[str, str]], tokenizer: Any) -> int:
     if hasattr(tokenizer, "apply_chat_template"):
         try:
             tokens = tokenizer.apply_chat_template(
@@ -62,6 +45,8 @@ def _count_chat_tokens(messages: List[Dict[str, str]], tokenizer: AutoTokenizer)
                 add_generation_prompt=True,
                 tokenize=True,
             )
+            if hasattr(tokens, "keys"):
+                tokens = tokens["input_ids"]
             return len(tokens)
         except Exception:
             pass
@@ -71,15 +56,14 @@ def _count_chat_tokens(messages: List[Dict[str, str]], tokenizer: AutoTokenizer)
 
 def _truncate_messages(
     messages: List[Dict[str, str]],
-    tokenizer: Optional[AutoTokenizer],
+    tokenizer: Any,
     max_input_tokens: Optional[int],
     *,
     keep: str = "tail",
 ) -> List[Dict[str, str]]:
     if tokenizer is None or max_input_tokens is None:
         return messages
-    if max_input_tokens <= 0:
-        max_input_tokens = 0
+    max_input_tokens = max(0, max_input_tokens)
 
     user_idx = None
     for i in range(len(messages) - 1, -1, -1):
@@ -105,81 +89,47 @@ def _truncate_messages(
     if keep == "head":
         truncated_tokens = user_tokens[:allowed_user_tokens]
     else:
-        # Preserve the old default for quality prompts, where choices/answer cue
-        # are usually near the end of the user message.
         truncated_tokens = user_tokens[-allowed_user_tokens:]
     truncated_text = tokenizer.decode(truncated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     messages[user_idx]["content"] = truncated_text
     return messages
 
 
-def _get_input_token_margin() -> int:
-    raw = os.environ.get("INFERENCE_BENCH_INPUT_TOKEN_MARGIN", "16").strip()
-    try:
-        margin = int(raw)
-    except ValueError:
-        margin = 16
-    return max(0, margin)
-
-
 def _compute_max_input_tokens(max_model_len: Optional[int], max_new_tokens: int) -> Optional[int]:
     if max_model_len is None:
         return None
-    margin = _get_input_token_margin()
-    # Keep a fixed guard band to absorb tokenizer/chat-template mismatch at the boundary.
-    return max(0, int(max_model_len) - int(max_new_tokens) - 1 - int(margin))
+    margin = max(0, env_int("INFERENCE_BENCH_INPUT_TOKEN_MARGIN", 16))
+    return max(0, int(max_model_len) - int(max_new_tokens) - 1 - margin)
+
+
+def _hf_from_pretrained(loader, model_id: str, **kwargs):
+    cache_dir = os.environ.get("HF_HUB_CACHE") or os.environ.get("HF_HOME") or None
+    try:
+        return loader(model_id, local_files_only=True, cache_dir=cache_dir, **kwargs)
+    except Exception:
+        if os.environ.get("INFERENCE_BENCH_ALLOW_HF_DOWNLOAD", "").strip().lower() not in {"1", "true", "yes"}:
+            return None
+        try:
+            return loader(model_id, local_files_only=False, cache_dir=cache_dir, **kwargs)
+        except Exception:
+            return None
 
 
 def _get_model_max_len(model_id: str) -> Optional[int]:
-    _ensure_transformers()
-    env_value = os.environ.get("INFERENCE_BENCH_MAX_MODEL_LEN")
-    if env_value:
-        try:
-            return int(env_value)
-        except ValueError:
-            pass
-    cache_dir = os.environ.get("HF_HUB_CACHE") or os.environ.get("HF_HOME") or None
-    try:
-        cfg = AutoConfig.from_pretrained(model_id, local_files_only=True, cache_dir=cache_dir)
-        max_len = getattr(cfg, "max_position_embeddings", None) or getattr(cfg, "model_max_length", None)
-        if isinstance(max_len, int) and max_len > 0:
-            return max_len
-    except Exception:
-        allow_download = os.environ.get("INFERENCE_BENCH_ALLOW_HF_DOWNLOAD", "").strip().lower() in {"1", "true", "yes"}
-        if not allow_download:
-            return None
-        try:
-            cfg = AutoConfig.from_pretrained(model_id, local_files_only=False, cache_dir=cache_dir)
-            max_len = getattr(cfg, "max_position_embeddings", None) or getattr(cfg, "model_max_length", None)
-            if isinstance(max_len, int) and max_len > 0:
-                return max_len
-        except Exception:
-            return None
-    return None
+    env_value = env_int("INFERENCE_BENCH_MAX_MODEL_LEN", 0)
+    if env_value > 0:
+        return env_value
+    if not model_id:
+        return None
+    from transformers import AutoConfig
+    cfg = _hf_from_pretrained(AutoConfig.from_pretrained, model_id)
+    max_len = getattr(cfg, "max_position_embeddings", None) or getattr(cfg, "model_max_length", None)
+    return max_len if isinstance(max_len, int) and max_len > 0 else None
 
 
-def _get_tokenizer(model_id: str):
-    _ensure_transformers()
-    cache_dir = os.environ.get("HF_HUB_CACHE") or os.environ.get("HF_HOME") or None
-    try:
-        return AutoTokenizer.from_pretrained(model_id, use_fast=True, local_files_only=True, cache_dir=cache_dir)
-    except Exception:
-        allow_download = os.environ.get("INFERENCE_BENCH_ALLOW_HF_DOWNLOAD", "").strip().lower() in {"1", "true", "yes"}
-        if not allow_download:
-            return None
-        try:
-            return AutoTokenizer.from_pretrained(model_id, use_fast=True, local_files_only=False, cache_dir=cache_dir)
-        except Exception:
-            return None
-
-
-def _messages_to_prompt_text(messages: List[Dict[str, Any]]) -> str:
-    parts: List[str] = []
-    for msg in messages:
-        content = msg.get("content")
-        if isinstance(content, str) and content.strip():
-            parts.append(content)
-    return "\n\n".join(parts)
+def _get_tokenizer(model_id: str) -> Any:
+    from transformers import AutoTokenizer
+    return _hf_from_pretrained(AutoTokenizer.from_pretrained, model_id, use_fast=True)
 
 
 def _request_content_hash(req: Dict[str, Any]) -> str:
@@ -187,7 +137,7 @@ def _request_content_hash(req: Dict[str, Any]) -> str:
         "messages": req.get("messages"),
         "max_new_tokens": req.get("max_new_tokens"),
         "temperature": req.get("temperature"),
-        "require_json": req.get("require_json", False),
+        "require_json": False,
         "ignore_eos": req.get("ignore_eos", False),
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -198,19 +148,14 @@ def _load_requests_jsonl(
     path: Path,
     config: Dict[str, Any],
     limit: Optional[int],
-    tokenizer: Optional[AutoTokenizer],
+    tokenizer: Any,
     max_model_len: Optional[int],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> List[Dict[str, Any]]:
     max_new_tokens_default = int(config.get("max_new_tokens", 256))
     temperature_default = float(config.get("temperature", 0.2))
-    require_json_default = bool(config.get("require_json", False))
-    dataset_overflow = (config.get("dataset_overflow") or os.environ.get("INFERENCE_BENCH_DATASET_OVERFLOW") or "filter").strip().lower()
-    hard_truncate = os.environ.get("INFERENCE_BENCH_DATASET_HARD_TRUNCATE", "1").strip() != "0"
-    synthetic_cfg = config.get("synthetic", {})
-    ignore_eos = synthetic_cfg.get("ignore_eos", False)
+    ignore_eos = config.get("synthetic", {}).get("ignore_eos", False)
 
     requests_list: List[Dict[str, Any]] = []
-    samples: List[Dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             if limit is not None and len(requests_list) >= limit:
@@ -226,35 +171,20 @@ def _load_requests_jsonl(
             gold = record.get("gold_answer", record.get("answer"))
             if isinstance(gold, str):
                 gold = gold.strip().upper()
-
-            parse_mode = record.get("parse_mode") or record.get("answer_format") or ""
-            if not parse_mode and isinstance(gold, str):
-                if gold in {"A", "B", "C", "D"}:
-                    parse_mode = "mcq"
-                elif re.fullmatch(r"[-+]?\d[\d,]*", gold):
-                    parse_mode = "gsm8k"
-
             max_new_tokens = int(record.get("max_new_tokens", max_new_tokens_default))
-            temperature = float(record.get("temperature", temperature_default))
-            require_json = bool(record.get("require_json", require_json_default))
-            record_ignore_eos = bool(record.get("ignore_eos", ignore_eos))
-            sample_id = record.get("sample_id") or record.get("_id") or ""
-            sample_id = str(sample_id) if sample_id is not None else ""
             if tokenizer is not None and max_model_len is not None:
                 max_input_tokens = _compute_max_input_tokens(max_model_len, max_new_tokens)
-                if dataset_overflow == "truncate" or hard_truncate:
-                    messages = _truncate_messages(messages, tokenizer, max_input_tokens)
+                messages = _truncate_messages(messages, tokenizer, max_input_tokens)
 
             req: Dict[str, Any] = {
                 "messages": messages,
                 "max_new_tokens": max_new_tokens,
-                "temperature": temperature,
-                "require_json": require_json,
+                "temperature": float(record.get("temperature", temperature_default)),
                 "gold_answer": gold,
-                "sample_id": sample_id,
-                "parse_mode": parse_mode,
+                "sample_id": str(record.get("sample_id") or record.get("_id") or ""),
+                "parse_mode": record.get("parse_mode") or "",
             }
-            if record_ignore_eos:
+            if record.get("ignore_eos", ignore_eos):
                 req["ignore_eos"] = True
             for meta_key in (
                 "target_input_token_count",
@@ -264,50 +194,9 @@ def _load_requests_jsonl(
             ):
                 if meta_key in record:
                     req[meta_key] = record.get(meta_key)
-            req["content_hash"] = record.get("content_hash") or _request_content_hash(req)
+            req["content_hash"] = _request_content_hash(req)
             requests_list.append(req)
-
-            samples.append({
-                "sample_id": sample_id,
-                "messages": messages,
-                "prompt_text": _messages_to_prompt_text(messages),
-                "answer": gold,
-                "content_hash": req["content_hash"],
-                "target_input_token_count": req.get("target_input_token_count"),
-                "input_token_count": req.get("input_token_count"),
-                "source_prompt_token_count": req.get("source_prompt_token_count"),
-            })
-
-    return requests_list, samples
-
-
-def _default_requests_file(task_dir: Path) -> Optional[Path]:
-    scenario = os.environ.get("INFERENCE_BENCH_SCENARIO", "").strip()
-    if not scenario:
-        return None
-
-    model_id = os.environ.get("INFERENCE_BENCH_BASE_MODEL", "").strip()
-    model_safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", model_id) if model_id else ""
-
-    # Search both task-bundle and in-repo inference dirs.
-    # Preferred layout:
-    #   baselines/speed/{backend}/{scenario}/{model_safe}/requests.jsonl
-    # Also support scenario-level requests and legacy baseline layout.
-    roots = [
-        task_dir / "inference",
-        Path(__file__).resolve().parent,
-    ]
-    candidates: List[Path] = []
-    for root in roots:
-        for backend in ("torch", "vllm"):
-            if model_safe:
-                candidates.append(root / "baselines" / "speed" / backend / scenario / model_safe / "requests.jsonl")
-            candidates.append(root / "baselines" / "speed" / backend / scenario / "requests.jsonl")
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
+    return requests_list
 
 
 def _find_longbench_samples_file(
@@ -317,47 +206,27 @@ def _find_longbench_samples_file(
     *,
     allow_smaller: bool = True,
 ) -> Optional[Path]:
-    """Find a pre-cached LongBench-v2 samples file for the given seed with at least min_n rows.
-
-    Searches baselines/samples/longbench_v2/{seed}_{N}/samples.jsonl and returns
-    the file whose N is the smallest value >= min_n.  Optionally falls back to
-    the largest available N for that seed if none meets the minimum.
-    """
     base = inference_dir / "baselines" / "samples" / "longbench_v2"
     if not base.is_dir():
         return None
 
     candidates: List[Tuple[int, Path]] = []
     for cand in base.glob(f"{seed}_*/samples.jsonl"):
-        parent = cand.parent.name
-        if not parent.startswith(f"{seed}_"):
-            continue
         try:
-            n = int(parent.split("_", 1)[1])
-        except Exception:
+            n = int(cand.parent.name.split("_", 1)[1])
+        except ValueError:
             continue
         candidates.append((n, cand))
 
     if not candidates:
         return None
 
-    # Prefer smallest N that still satisfies min_n (avoid loading unnecessarily large files).
     sufficient = [(n, p) for n, p in candidates if n >= min_n]
     if sufficient:
         return min(sufficient, key=lambda x: x[0])[1]
     if allow_smaller:
         return max(candidates, key=lambda x: x[0])[1]
     return None
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
 
 
 def _range_ratio(value: Any) -> float:
@@ -373,19 +242,9 @@ def _range_ratio(value: Any) -> float:
 def _prepare_requests(
     config: Dict[str, Any],
     limit: Optional[int],
-    tokenizer: Optional[AutoTokenizer],
+    tokenizer: Any,
     max_model_len: Optional[int],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Load LongBench-v2 samples for speed evaluation.
-
-    Uses scenario config's synthetic.input_len / synthetic.output_len to control
-    request sizes:
-    - input_len: each request draws a target input length uniformly from
-      [range_ratio * effective_input_len, effective_input_len], then selects
-      a LongBench prompt long enough for that target and head-truncates to it.
-    - output_len: max_new_tokens is sampled uniformly from
-      [range_ratio * output_len, output_len].
-    """
+) -> List[Dict[str, Any]]:
     speed_cfg = config.get("synthetic", {})
     max_new_tokens_default = int(config.get("max_new_tokens", 256))
     input_len = int(speed_cfg.get("input_len", 1024))
@@ -393,24 +252,20 @@ def _prepare_requests(
     range_ratio = _range_ratio(speed_cfg.get("range_ratio", 0.8))
     ignore_eos = bool(speed_cfg.get("ignore_eos", True))
     temperature = float(config.get("temperature", 0.2))
-    seed = int(config.get("dataset_seed", 248))
+    seed = int(config.get("dataset_seed", DEFAULT_SEED))
 
     num_reqs = int(config.get("num_requests", 32))
     if limit is not None:
         num_reqs = min(num_reqs, limit)
 
     inference_dir = Path(__file__).resolve().parent
-    pool_n = max(num_reqs, _env_int("INFERENCE_BENCH_LONGBENCH_POOL_N", 503))
+    pool_n = max(num_reqs, env_int("INFERENCE_BENCH_LONGBENCH_POOL_N", 503))
     samples_path = _find_longbench_samples_file(inference_dir, seed, pool_n, allow_smaller=False)
 
     if samples_path is None:
-        # Fallback: generate cache on the fly (requires HF datasets + cache).
-        print(
-            f"[eval:speed] no pre-cached LongBench-v2 file found for seed={seed} n>={pool_n}; "
-            "generating on the fly (this may be slow)"
-        )
-        from .cache_samples import cache_longbench_v2, _enable_soft_filelock
-        _enable_soft_filelock()
+        print(f"[eval:speed] no cached LongBench-v2 samples for seed={seed} n>={pool_n}; generating them")
+        from .cache_samples import cache_longbench_v2, enable_soft_filelock
+        enable_soft_filelock()
         tmp_path = (
             inference_dir / "baselines" / "samples" / "longbench_v2"
             / f"{seed}_{pool_n}" / "samples.jsonl"
@@ -422,10 +277,7 @@ def _prepare_requests(
             fallback = _find_longbench_samples_file(inference_dir, seed, num_reqs, allow_smaller=True)
             if fallback is None:
                 raise
-            print(
-                f"[eval:speed] WARNING: failed to generate LongBench-v2 pool n={pool_n}: {exc}; "
-                f"falling back to cached file {fallback}"
-            )
+            print(f"[eval:speed] WARNING: LongBench-v2 sample generation failed ({exc}); using {fallback}")
             samples_path = fallback
 
     print(
@@ -435,10 +287,8 @@ def _prepare_requests(
 
     if tokenizer is None:
         raise RuntimeError(
-            "LongBench-v2 speed sampling requires the base model tokenizer to draw and verify "
-            "input token lengths. Provide a precomputed requests.jsonl via --requests-file or "
-            "INFERENCE_BENCH_REQUESTS_FILE, pre-cache the tokenizer, or set "
-            "INFERENCE_BENCH_ALLOW_HF_DOWNLOAD=1."
+            "LongBench-v2 sampling needs the base model tokenizer; pass --requests-file, "
+            "pre-cache the tokenizer, or set INFERENCE_BENCH_ALLOW_HF_DOWNLOAD=1."
         )
 
     target_input_len = input_len
@@ -475,7 +325,6 @@ def _prepare_requests(
     output_rng = random.Random(f"{seed}:output:{target_input_len}:{output_len}:{range_ratio}")
 
     requests_list: List[Dict[str, Any]] = []
-    samples: List[Dict[str, Any]] = []
     for req_idx in range(num_reqs):
         target_input_tokens = input_rng.randint(min_input_tokens, target_input_len)
         candidates = [
@@ -508,8 +357,7 @@ def _prepare_requests(
             "messages": messages,
             "max_new_tokens": max_new_tokens,
             "temperature": temperature,
-            "require_json": False,
-            "gold_answer": None,  # speed eval: no quality scoring
+            "gold_answer": None,
             "sample_id": str(record.get("sample_id", "")),
             "parse_mode": "",
             "ignore_eos": ignore_eos,
@@ -520,21 +368,10 @@ def _prepare_requests(
         }
         req["content_hash"] = _request_content_hash(req)
         requests_list.append(req)
-        samples.append({
-            "sample_id": req["sample_id"],
-            "messages": messages,
-            "prompt_text": _messages_to_prompt_text(messages),
-            "target_input_token_count": target_input_tokens,
-            "input_token_count": realized_input_tokens,
-            "source_prompt_token_count": source_prompt_tokens,
-            "max_new_tokens": max_new_tokens,
-            "content_hash": req["content_hash"],
-        })
-
-    return requests_list, samples
+    return requests_list
 
 
-def _schedule(pattern: str, count: int, rate_per_s: Optional[float]) -> List[float]:
+def _schedule(pattern: str, count: int, rate_per_s: Optional[float], seed: Union[int, str] = DEFAULT_SEED) -> List[float]:
     if pattern == "burst":
         return [0.0] * count
     if rate_per_s is None or rate_per_s <= 0:
@@ -544,9 +381,10 @@ def _schedule(pattern: str, count: int, rate_per_s: Optional[float]) -> List[flo
         for i in range(count):
             delays.append(i / rate_per_s)
     elif pattern == "poisson":
+        rng = random.Random(seed)
         t = 0.0
         for _ in range(count):
-            t += random.expovariate(rate_per_s)
+            t += rng.expovariate(rate_per_s)
             delays.append(t)
     else:
         raise ValueError(f"Unknown pattern: {pattern}")
@@ -557,12 +395,42 @@ def _extract_delta_text(chunk: Dict[str, Any]) -> str:
     choices = chunk.get("choices") or []
     if not choices:
         return ""
-    delta = choices[0].get("delta") or {}
-    if "content" in delta:
-        return delta["content"] or ""
-    if "text" in choices[0]:
-        return choices[0]["text"] or ""
-    return ""
+    delta = choices[0].get("delta") or choices[0].get("message") or {}
+    text = delta.get("content", choices[0].get("text", "")) or ""
+    if not isinstance(text, str):
+        raise ValueError("Completion content must be text")
+    return text
+
+
+def _parse_completion_line(line: bytes) -> Optional[Dict[str, Any]]:
+    line = line.strip()
+    if not line.startswith(b"data:"):
+        return {}
+    data = line[len(b"data:"):].strip()
+    if data == b"[DONE]":
+        return None
+    parsed = json.loads(data.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError("Invalid completion event")
+    return parsed
+
+
+async def _completion_events(content):
+    buffer = b""
+    async for chunk in content.iter_any():
+        buffer += chunk
+        if buffer.lstrip().startswith(b"{"):
+            continue
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            event = _parse_completion_line(line)
+            yield event
+            if event is None:
+                return
+    if buffer.lstrip().startswith(b"{"):
+        yield json.loads(buffer.decode("utf-8"))
+    elif buffer.strip():
+        yield _parse_completion_line(buffer)
 
 
 async def _stream_chat_completion(
@@ -575,52 +443,41 @@ async def _stream_chat_completion(
     first_token_time: Optional[float] = None
     most_recent_time: Optional[float] = None
     text_parts: List[str] = []
-    chunk_itls: List[float] = []  # per-chunk inter-token latencies
-    output_tokens: Optional[int] = None  # server-reported completion tokens
+    chunk_itls: List[float] = []
+    output_tokens: Optional[int] = None
     error: Optional[str] = None
 
-    raw_chunks: List[str] = []
+    retryable = False
+    stream_finished = False
 
     try:
         async with session.post(url, json=payload, timeout=timeout_s) as resp:
             if resp.status != 200:
                 error = await resp.text()
-                end = time.perf_counter()
-                return {
-                    "success": False,
-                    "empty_output": False,
-                    "start": start,
-                    "end": end,
-                    "first_token_time": None,
-                    "text": "",
-                    "error": error,
-                    "chunk_itls": [],
-                    "output_tokens": None,
-                }
-
-            buffer = ""
-            async for chunk in resp.content.iter_any():
-                piece = chunk.decode("utf-8", errors="ignore")
-                raw_chunks.append(piece)
-                buffer += piece
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[len("data:"):].strip()
-                    if data == "[DONE]":
+            elif "application/json" in resp.headers.get("Content-Type", "").lower():
+                parsed = await resp.json(content_type=None)
+                if parsed.get("error"):
+                    raise ValueError(json.dumps(parsed["error"]))
+                text_parts.append(_extract_delta_text(parsed))
+                output_tokens = (parsed.get("usage") or {}).get("completion_tokens")
+            else:
+                async for parsed in _completion_events(resp.content):
+                    if parsed is None:
+                        stream_finished = True
                         break
-                    try:
-                        parsed = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    # Extract server-reported usage (vLLM/SGLang include this
-                    # in the final chunk or in stream_options.include_usage).
+                    if parsed.get("error"):
+                        raise ValueError(json.dumps(parsed["error"]))
                     usage = parsed.get("usage") or {}
-                    if usage.get("completion_tokens"):
-                        output_tokens = int(usage["completion_tokens"])
+                    if usage.get("completion_tokens") is not None:
+                        output_tokens = usage["completion_tokens"]
+                    choices = parsed.get("choices") or []
+                    if choices and choices[0].get("finish_reason") is not None:
+                        stream_finished = True
                     delta_text = _extract_delta_text(parsed)
+                    if choices and "message" in choices[0]:
+                        text_parts.append(delta_text)
+                        stream_finished = True
+                        continue
                     if delta_text:
                         now = time.perf_counter()
                         if first_token_time is None:
@@ -629,43 +486,24 @@ async def _stream_chat_completion(
                             chunk_itls.append(now - most_recent_time)
                         most_recent_time = now
                         text_parts.append(delta_text)
+                if not stream_finished:
+                    raise ValueError("Completion stream ended without a finish event")
+            if output_tokens is not None and (type(output_tokens) is not int or output_tokens < 0):
+                raise ValueError("Completion token count must be a nonnegative integer")
     except asyncio.TimeoutError:
         error = f"timeout after {timeout_s}s"
+        retryable = True
     except aiohttp.ClientError as exc:
+        error = str(exc)
+        retryable = True
+    except (ValueError, TypeError, AttributeError) as exc:
         error = str(exc)
 
     end = time.perf_counter()
     text = "".join(text_parts)
-
-    # Some OpenAI-compatible servers ignore `stream=true` and return a single JSON response.
-    # If we didn't parse any SSE deltas, attempt to parse the full payload as JSON.
-    if error is None and not text:
-        raw = "".join(raw_chunks).strip()
-        if raw.startswith("{"):
-            try:
-                parsed = json.loads(raw)
-                choices = parsed.get("choices") or []
-                if choices:
-                    msg = choices[0].get("message") or {}
-                    content = msg.get("content")
-                    if isinstance(content, str) and content:
-                        text = content
-                usage = parsed.get("usage") or {}
-                if usage.get("completion_tokens"):
-                    output_tokens = int(usage["completion_tokens"])
-            except Exception:
-                pass
-
-    # A request is successful if no transport error occurred.
-    # Empty output (server responded but generated nothing) is tracked separately.
-    has_error = error is not None
-    has_text = len(text) > 0
-    success = not has_error and has_text
-    empty_output = not has_error and not has_text
-
     return {
-        "success": success,
-        "empty_output": empty_output,
+        "success": error is None and bool(text),
+        "empty_output": error is None and not text,
         "start": start,
         "end": end,
         "first_token_time": first_token_time,
@@ -673,77 +511,55 @@ async def _stream_chat_completion(
         "error": error,
         "chunk_itls": chunk_itls,
         "output_tokens": output_tokens,
+        "retryable": retryable,
     }
 
 
-def _count_tokens(text: str) -> int:
-    if not text:
-        return 0
+def _count_words(text: str) -> int:
     return len(text.split())
 
 
-def _validate_json(text: str) -> bool:
-    try:
-        json.loads(text)
-        return True
-    except json.JSONDecodeError:
-        return False
-
-
 def _extract_choice_answer(text: str) -> Optional[str]:
-    """Extract a multiple-choice answer letter (A-J) from model output.
-
-    Uses a 3-level fallback strategy aligned with the official MMLU-Pro
-    extraction logic (TIGER-AI-Lab/MMLU-Pro), extended with additional
-    common patterns.
-    """
     if not text:
         return None
     upper = text.upper()
-    # Level 1 (official MMLU-Pro primary): "the answer is (X)" / "answer is X"
-    m = re.search(r"ANSWER\s+IS\s*\(?([A-J])\)?", upper)
+
+    finals = re.findall(r"\bFINAL(?:\s+ANSWER)?\s*(?::|-|\bIS\b)\s*\(?([A-J])\)?(?!\w)", upper)
+    if finals:
+        return finals[-1]
+
+    m = re.search(r"ANSWER\s+IS\s*\(?([A-J])\)?(?!\w)", upper)
     if m:
         return m.group(1)
-    # Level 2 (official MMLU-Pro secondary): "Answer: X"
+
     m = re.search(r"ANSWER\s*[:\-]\s*([A-J])\b", upper)
     if m:
         return m.group(1)
-    # Additional explicit forms.
+
+    m = re.search(r"^\s*([A-J])\s*[\)\.\:\-]", upper)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"^\s*([A-J])\s*(?:\n|$)", upper)
+    if m:
+        return m.group(1)
+
     for pattern in [
         r"CORRECT\s+ANSWER\s*(IS|:)?\s*([A-J])\b",
         r"(OPTION|CHOICE)\s*([A-J])\b",
-        r"FINAL\s*[:\-]\s*([A-J])\b",
     ]:
         m = re.search(pattern, upper)
         if m:
             return m.group(m.lastindex)
-    # Leading "B)" or "B." at start of text.
-    m = re.search(r"^\s*([A-J])\s*[\)\.\:\-]", upper)
-    if m:
-        return m.group(1)
-    # Standalone letter on its own line.
+
     m = re.search(r"^\s*([A-J])\s*$", upper, re.MULTILINE)
     if m:
         return m.group(1)
-    # Level 3 (official MMLU-Pro fallback): last standalone A-J letter in text.
+
     m = re.search(r"\b([A-J])\b(?!.*\b[A-J]\b)", upper, re.DOTALL)
     if m:
         return m.group(1)
     return None
-
-
-def _extract_gsm8k_answer(text: str) -> Optional[str]:
-    if not text:
-        return None
-    # Prefer an explicit "Answer:" span.
-    match = re.search(r"(?i)\banswer\s*[:\-]\s*([-+]?\d[\d,]*)\b", text)
-    if match:
-        return match.group(1).replace(",", "")
-    # Otherwise take the last integer-like token.
-    numbers = re.findall(r"[-+]?\d[\d,]*", text)
-    if not numbers:
-        return None
-    return numbers[-1].replace(",", "")
 
 
 def _get_user_content(messages: List[Dict[str, str]]) -> str:
@@ -771,7 +587,7 @@ def _first_sentence(text: str, max_len: int = 200) -> str:
 def _extract_question(text: str) -> str:
     if not text:
         return ""
-    matches = re.findall(r"Question\\s*:\\s*(.*)", text, flags=re.IGNORECASE)
+    matches = re.findall(r"Question\s*:\s*(.*)", text, flags=re.IGNORECASE)
     if matches:
         candidate = matches[-1].strip()
         if candidate:
@@ -787,17 +603,30 @@ async def _run_profile(
     model: str,
     timeout_s: float,
     log_path: Optional[Path],
+    seed: int = DEFAULT_SEED,
 ) -> Tuple[List[Dict[str, Any]], float, float]:
     pattern = profile.get("pattern", "burst")
     rate_per_s = profile.get("rate_per_s")
     concurrency = int(profile.get("concurrency", 1))
     num_requests = int(profile.get("num_requests", len(requests_list)))
+    if not requests_list or num_requests <= 0:
+        raise ValueError("A profile requires at least one request")
+    if concurrency <= 0:
+        raise ValueError("Profile concurrency must be positive")
 
-    delays = _schedule(pattern, num_requests, rate_per_s)
+    profile_name = profile.get("name") or pattern
+    schedule_identity = {
+        "seed": seed,
+        "name": profile_name,
+        "pattern": pattern,
+        "rate_per_s": rate_per_s,
+        "num_requests": num_requests,
+        "concurrency": concurrency,
+    }
+    schedule_seed = hashlib.sha256(json.dumps(schedule_identity, sort_keys=True).encode("utf-8")).hexdigest()
+    delays = _schedule(pattern, num_requests, rate_per_s, schedule_seed)
     sem = asyncio.Semaphore(concurrency)
     results: List[Dict[str, Any]] = []
-
-    max_retries = 2  # 1 original + 1 retry on transient failure
 
     async with aiohttp.ClientSession() as session:
         async def _run_one(index: int, req: Dict[str, Any], delay: float) -> None:
@@ -809,51 +638,46 @@ async def _run_profile(
                     "stream": True,
                     "max_tokens": req["max_new_tokens"],
                     "temperature": req["temperature"],
+                    "stream_options": {"include_usage": True},
                 }
                 if req.get("ignore_eos"):
                     payload["ignore_eos"] = True
                 url = f"{server_url}/v1/chat/completions"
                 result = await _stream_chat_completion(session, url, payload, timeout_s)
-                # Retry once on transient connection failures (timeout, connection reset).
-                # Do NOT retry on HTTP errors (4xx/5xx) — those indicate the server
-                # processed the request and returned a valid error.
-                for _retry in range(1, max_retries):
-                    if result["success"]:
-                        break
-                    err = (result.get("error") or "").lower()
-                    is_transient = ("timeout" in err or
-                                    "connect" in err or
-                                    "reset" in err)
-                    if not is_transient:
-                        break
-                    await asyncio.sleep(2 ** _retry)
+                request_start = result["start"]
+                if not result["success"] and result["retryable"]:
+                    await asyncio.sleep(2)
                     result = await _stream_chat_completion(session, url, payload, timeout_s)
+                result["start"] = request_start
                 result["request_index"] = index
+                result["profile"] = profile_name
                 result["pattern"] = pattern
-                result["require_json"] = req.get("require_json", False)
+                result["run_seed"] = seed
+                result["schedule_seed"] = schedule_seed
+                result["scheduled_delay_s"] = delay
+                result["requested_output_tokens"] = req["max_new_tokens"]
                 result["gold_answer"] = req.get("gold_answer")
                 result["sample_id"] = req.get("sample_id")
                 user_content = _get_user_content(req.get("messages", []))
                 result["input_first_sentence"] = _first_sentence(user_content)
                 result["input_question"] = _extract_question(user_content)
+                if result["success"] and req.get("ignore_eos"):
+                    output_tokens = result.get("output_tokens")
+                    if type(output_tokens) is not int or output_tokens != req["max_new_tokens"]:
+                        result["success"] = False
+                        result["retryable"] = False
+                        result["error"] = (
+                            "Output token count does not match the ignore_eos request: "
+                            f"requested_output_tokens={req['max_new_tokens']} returned_output_tokens={output_tokens!r}"
+                        )
+                result["tokens"] = 0
+                result["parsed_answer"] = None
                 if result["success"]:
-                    # Prefer server-reported token count, fall back to word-split.
-                    result["tokens"] = result.get("output_tokens") or _count_tokens(result["text"])
-                    if result["require_json"]:
-                        result["json_valid"] = _validate_json(result["text"])
-                    else:
-                        result["json_valid"] = None
-                    parse_mode = (req.get("parse_mode") or "").strip().lower()
-                    if parse_mode == "gsm8k":
-                        result["parsed_answer"] = _extract_gsm8k_answer(result["text"])
-                    elif parse_mode in ("mcq", "mcq10") or (not parse_mode and result.get("gold_answer")):
+                    output_tokens = result["output_tokens"]
+                    result["tokens"] = _count_words(result["text"]) if output_tokens is None else output_tokens
+                    parse_mode = req.get("parse_mode") or ""
+                    if parse_mode in ("mcq", "mcq10") or (not parse_mode and result["gold_answer"]):
                         result["parsed_answer"] = _extract_choice_answer(result["text"])
-                    else:
-                        result["parsed_answer"] = None
-                else:
-                    result["tokens"] = 0
-                    result["json_valid"] = None
-                    result["parsed_answer"] = None
                 results.append(result)
                 done = len(results)
                 if done == num_requests or done % max(1, num_requests // 20) == 0:
@@ -876,6 +700,11 @@ async def _run_profile(
             for r in results:
                 record = {
                     "request_index": r.get("request_index"),
+                    "profile": r.get("profile"),
+                    "pattern": r.get("pattern"),
+                    "run_seed": r.get("run_seed"),
+                    "schedule_seed": r.get("schedule_seed"),
+                    "scheduled_delay_s": r.get("scheduled_delay_s"),
                     "sample_id": r.get("sample_id"),
                     "input_first_sentence": r.get("input_first_sentence"),
                     "input_question": r.get("input_question"),
@@ -887,6 +716,7 @@ async def _run_profile(
                     "error": r.get("error"),
                     "tokens": r.get("tokens"),
                     "output_tokens": r.get("output_tokens"),
+                    "requested_output_tokens": r.get("requested_output_tokens"),
                 }
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -908,13 +738,8 @@ def _summarize_results(results: List[Dict[str, Any]], wall_start: float, wall_en
     successes = [r for r in results if r["success"]]
     failures = [r for r in results if not r["success"] and not r.get("empty_output")]
     empty_outputs = [r for r in results if r.get("empty_output")]
+    ttft_values = [r["first_token_time"] - r["start"] for r in successes + empty_outputs if r.get("first_token_time")]
 
-    # TTFT: also include empty-output requests (server responded, just no content).
-    ttft_candidates = successes + empty_outputs
-    ttft_values = [r["first_token_time"] - r["start"] for r in ttft_candidates if r.get("first_token_time")]
-
-    # ITL: prefer per-chunk latencies collected during streaming (matches InferenceX).
-    # Fall back to estimated ITL for requests without chunk data (e.g. non-streaming).
     itl_values: List[float] = []
     tpot_values: List[float] = []
     total_tokens = 0
@@ -925,33 +750,20 @@ def _summarize_results(results: List[Dict[str, Any]], wall_start: float, wall_en
         if r.get("first_token_time") is not None:
             decode_time = r["end"] - r["first_token_time"]
             total_decode_time += max(decode_time, 0.0)
-            # TPOT: per-request average decode latency (like InferenceX).
             if tokens > 1:
                 tpot_values.append(decode_time / (tokens - 1))
-        # ITL: use actual per-chunk timestamps when available.
+
         chunk_itls = r.get("chunk_itls") or []
         if chunk_itls:
             itl_values.extend(chunk_itls)
         elif r.get("first_token_time") is not None and tokens > 1:
-            # Fallback: estimate from total decode time (old behavior).
             itl_values.append((r["end"] - r["first_token_time"]) / (tokens - 1))
 
     wall_time = max(wall_end - wall_start, 1e-6)
-    req_throughput = len(results) / wall_time
+    req_throughput = len(successes) / wall_time
     gen_throughput = (total_tokens / total_decode_time) if total_decode_time > 0 else 0.0
 
-    json_required = [r for r in results if r.get("require_json")]
-    json_valid = [r for r in json_required if r.get("json_valid")]
-    json_rate = (len(json_valid) / len(json_required)) if json_required else None
-
-    answerable = [r for r in results if r.get("gold_answer")]
-    correct = [
-        r for r in answerable
-        if r.get("parsed_answer") and r.get("parsed_answer") == r.get("gold_answer")
-    ]
-    accuracy = (len(correct) / len(answerable)) if answerable else None
-
-    metrics = {
+    return {
         "request_count": len(results),
         "success_count": len(successes),
         "failure_count": len(failures),
@@ -962,10 +774,8 @@ def _summarize_results(results: List[Dict[str, Any]], wall_start: float, wall_en
         "tpot": _percentiles(tpot_values),
         "generation_throughput_tokens_per_s": gen_throughput,
         "request_throughput_req_per_s": req_throughput,
-        "json_valid_rate": json_rate,
-        "choice_accuracy": accuracy,
+        "choice_accuracy": _compute_choice_accuracy(results),
     }
-    return metrics
 
 
 def _compute_choice_accuracy(results: List[Dict[str, Any]]) -> Optional[float]:
@@ -1017,10 +827,10 @@ def _detect_model_id(server_url: str, fallback: str) -> str:
         if response.status_code == 200:
             data = response.json().get("data") or []
             if data:
-                return data[0].get("id", fallback) or fallback
+                return data[0].get("id") or ""
     except requests.RequestException:
         pass
-    return fallback or "unknown"
+    return "unknown"
 
 
 def _wait_for_server(server_url: str, timeout_s: float) -> None:
@@ -1055,7 +865,6 @@ def _write_requests_used(path: Path, requests_list: List[Dict[str, Any]]) -> Non
                         "sample_id": req.get("sample_id"),
                         "max_new_tokens": req.get("max_new_tokens"),
                         "temperature": req.get("temperature"),
-                        "require_json": req.get("require_json", False),
                         "parse_mode": req.get("parse_mode", ""),
                         "ignore_eos": req.get("ignore_eos", False),
                         "target_input_token_count": req.get("target_input_token_count"),
@@ -1070,67 +879,35 @@ def _write_requests_used(path: Path, requests_list: List[Dict[str, Any]]) -> Non
             )
 
 
-def _compute_accuracy(results: List[Dict[str, Any]]) -> Optional[float]:
-    answerable = [r for r in results if r.get("gold_answer") is not None]
-    if not answerable:
-        return None
-    correct = [
-        r for r in answerable
-        if (r.get("parsed_answer") is not None) and (r.get("parsed_answer") == r.get("gold_answer"))
-    ]
-    return len(correct) / len(answerable)
+def _build_profiles(config: Dict[str, Any], num_requests: int, concurrency: Optional[int] = None) -> List[Dict[str, Any]]:
+    profiles = []
+    for profile in config.get("profiles") or [config.get("profile", {"name": "default", "pattern": "burst"})]:
+        profile = {"concurrency": config.get("concurrency", 1), **profile, "num_requests": num_requests}
+        if concurrency is not None:
+            profile["concurrency"] = concurrency
+        profiles.append(profile)
+    return profiles
 
 
 def run_speed_eval(task_dir: Path, args: argparse.Namespace, artifact_dir: Path) -> Dict[str, Any]:
     config = load_scenario_config(task_dir)
-    if args.seed is not None:
-        config["dataset_seed"] = args.seed
-    print(f"[eval:speed] scenario={config.get('scenario_id')} dataset_seed={config.get('dataset_seed')}")
+    config["dataset_seed"] = args.seed
+    print(f"[eval:speed] scenario={config.get('scenario_id')} dataset_seed={config['dataset_seed']}")
 
-    # Prefer a precomputed requests file if available (avoids slow dataset loading/tokenization).
-    requests_source: Optional[Path] = None
-    if getattr(args, "requests_file", None):
-        requests_source = Path(args.requests_file)
-    else:
-        env_requests = os.environ.get("INFERENCE_BENCH_REQUESTS_FILE", "").strip()
-        if env_requests:
-            requests_source = Path(env_requests)
-        else:
-            requests_source = _default_requests_file(task_dir)
+    requests_file = args.requests_file or os.environ.get("INFERENCE_BENCH_REQUESTS_FILE", "").strip()
+    requests_source = Path(requests_file) if requests_file else None
+    if requests_source is not None and not requests_source.exists():
+        raise FileNotFoundError(requests_source)
 
-    dataset_samples: List[Dict[str, Any]] = []
-    if requests_source is not None and requests_source.exists():
-        base_model = args.model or os.environ.get("INFERENCE_BENCH_BASE_MODEL", "")
-        tokenizer = _get_tokenizer(base_model) if base_model else None
-        max_model_len_env = os.environ.get("INFERENCE_BENCH_MAX_MODEL_LEN", "").strip()
-        max_model_len: Optional[int] = int(max_model_len_env) if max_model_len_env.isdigit() else None
-        if max_model_len is None and base_model:
-            max_model_len = _get_model_max_len(base_model)
-        base_requests, dataset_samples = _load_requests_jsonl(
-            requests_source,
-            config,
-            args.request_limit,
-            tokenizer=tokenizer,
-            max_model_len=max_model_len,
-        )
+    base_model = args.model or os.environ.get("INFERENCE_BENCH_BASE_MODEL", "")
+    tokenizer = _get_tokenizer(base_model) if base_model else None
+    max_model_len = _get_model_max_len(base_model)
+
+    if requests_source is not None:
         print(f"[eval:speed] using requests file: {requests_source}")
+        base_requests = _load_requests_jsonl(requests_source, config, args.request_limit, tokenizer, max_model_len)
     else:
-        # Fall back to dataset sampling (slower, but works without precomputed requests).
-        base_model = args.model or os.environ.get("INFERENCE_BENCH_BASE_MODEL", "")
-        tokenizer = _get_tokenizer(base_model) if base_model else None
-        max_model_len_env = os.environ.get("INFERENCE_BENCH_MAX_MODEL_LEN", "").strip()
-        max_model_len: Optional[int] = int(max_model_len_env) if max_model_len_env.isdigit() else None
-        if max_model_len is None and base_model:
-            max_model_len = _get_model_max_len(base_model)
-        base_requests, dataset_samples = _prepare_requests(
-            config,
-            limit=args.request_limit,
-            tokenizer=tokenizer,
-            max_model_len=max_model_len,
-        )
-        # Logging handled inside _prepare_requests (longbench_v2 mode).
-
-    print(f"[eval:speed] prepared {len(base_requests)} requests (limit={args.request_limit})")
+        base_requests = _prepare_requests(config, args.request_limit, tokenizer, max_model_len)
 
     used_requests_path = artifact_dir / "requests_used_speed.jsonl"
     _write_requests_used(used_requests_path, base_requests)
@@ -1139,53 +916,39 @@ def run_speed_eval(task_dir: Path, args: argparse.Namespace, artifact_dir: Path)
     model_id = _detect_model_id(args.server_url, args.model)
     print(f"[eval:speed] server_url={args.server_url} model_id={model_id}")
 
-    profiles = config.get("profiles")
-    if not profiles:
-        profiles = [config.get("profile", {"name": "default", "pattern": "burst"})]
-    if dataset_samples:
-        adjusted_profiles = []
-        for profile in profiles:
-            profile_copy = dict(profile)
-            profile_copy["num_requests"] = len(base_requests)
-            adjusted_profiles.append(profile_copy)
-        profiles = adjusted_profiles
-
     stop_event = threading.Event()
     vram_out: List[float] = []
-    sampler = threading.Thread(target=_sample_vram_peak, args=(stop_event, 0.5, vram_out))
-    sampler.daemon = True
+    sampler = threading.Thread(target=_sample_vram_peak, args=(stop_event, 0.5, vram_out), daemon=True)
     sampler.start()
 
     profile_metrics: Dict[str, Any] = {}
     log_path_env = os.environ.get("INFERENCE_BENCH_GENERATION_LOG", "").strip()
     log_path = Path(log_path_env) if log_path_env else (artifact_dir / "speed_generations.jsonl")
-    if log_path.exists():
-        log_path.unlink()
+    log_path.unlink(missing_ok=True)
 
-    for profile in profiles:
-        profile_name = profile.get("name") or profile.get("pattern", "profile")
-        print(
-            "[eval:speed] running profile "
-            f"name={profile_name} pattern={profile.get('pattern')} "
-            f"num_requests={profile.get('num_requests', len(base_requests))} "
-            f"concurrency={profile.get('concurrency', 1)}"
-        )
-        results, wall_start, wall_end = asyncio.run(
-            _run_profile(profile, base_requests, args.server_url, model_id, args.request_timeout_s, log_path)
-        )
-        successes = len([r for r in results if r.get("success")])
-        print(f"[eval:speed] profile={profile_name} results={len(results)} success={successes}")
-        profile_metrics[profile_name] = _summarize_results(results, wall_start, wall_end)
-
-    stop_event.set()
-    sampler.join(timeout=2)
+    try:
+        for profile in _build_profiles(config, len(base_requests)):
+            profile_name = profile.get("name") or profile.get("pattern", "profile")
+            print(
+                "[eval:speed] running profile "
+                f"name={profile_name} pattern={profile.get('pattern')} "
+                f"num_requests={profile['num_requests']} concurrency={profile['concurrency']}"
+            )
+            results, wall_start, wall_end = asyncio.run(
+                _run_profile(profile, base_requests, args.server_url, model_id, args.request_timeout_s, log_path,
+                             config["dataset_seed"])
+            )
+            successes = sum(1 for r in results if r.get("success"))
+            print(f"[eval:speed] profile={profile_name} results={len(results)} success={successes}")
+            profile_metrics[profile_name] = _summarize_results(results, wall_start, wall_end)
+    finally:
+        stop_event.set()
+        sampler.join(timeout=2)
 
     return {
         "scenario": config.get("scenario_id"),
         "name": config.get("name"),
         "mission": config.get("mission"),
-        "dataset": config.get("dataset") or config.get("dataset_placeholder"),
-        "dataset_split": config.get("dataset_split"),
         "model_id": model_id,
         "profiles": profile_metrics,
         "vram_peak_mb": max(vram_out) if vram_out else 0.0,
@@ -1204,22 +967,21 @@ def run_quality_eval(
     artifact_dir: Path,
     tau: float,
 ) -> Dict[str, Any]:
-    specs, _, registry_path = quality_gate.get_quality_specs()
+    specs, registry_path = quality_gate.get_quality_specs(model_id)
 
     baseline: Dict[str, Any] = {}
     for spec in specs:
         acc, ref = quality_gate.load_quality_baseline_accuracy(registry_path, spec.name, spec.seed, spec.limit)
         baseline[spec.name] = {"accuracy": acc, "ref": ref}
 
-    # Require precomputed baselines for all datasets.
-    missing = [name for name, b in baseline.items() if not isinstance(b.get("accuracy"), (int, float))]
+    missing = [name for name, b in baseline.items() if b["accuracy"] is None]
     if missing:
         return {
             "tau": tau,
             "pass": False,
             "error": f"missing baseline accuracy for: {', '.join(missing)}",
             "baseline_registry": str(registry_path),
-            "datasets": {k: {"baseline_accuracy": v.get("accuracy"), "baseline_ref": v.get("ref")} for k, v in baseline.items()},
+            "datasets": {k: {"baseline_accuracy": v["accuracy"], "baseline_ref": v["ref"]} for k, v in baseline.items()},
         }
 
     run_results: Dict[str, Any] = {}
@@ -1229,93 +991,51 @@ def run_quality_eval(
             "name": f"quality_{spec.name}",
             "pattern": "burst",
             "num_requests": len(requests_list),
-            "concurrency": int(os.environ.get("INFERENCE_BENCH_QUALITY_CONCURRENCY", "4") or 4),
+            "concurrency": env_int("INFERENCE_BENCH_QUALITY_CONCURRENCY", 4),
         }
         log_path = artifact_dir / f"quality_{spec.name}_generations.jsonl"
-        if log_path.exists():
-            log_path.unlink()
+        log_path.unlink(missing_ok=True)
         results, _, _ = asyncio.run(
-            _run_profile(profile, requests_list, server_url, model_id, request_timeout_s, log_path)
+            _run_profile(profile, requests_list, server_url, model_id, request_timeout_s, log_path, spec.seed)
         )
+        succeeded = [r for r in results if r["success"] and not r.get("empty_output")]
         run_results[spec.name] = {
-            "accuracy": _compute_accuracy(results),
-            "count": len([r for r in results if r.get("gold_answer") is not None]),
+            "accuracy": _compute_choice_accuracy(results),
+            "complete": len(succeeded) == len(results) == len(requests_list),
             "samples_file": str(spec.samples_file),
             "generation_log_file": str(log_path),
             "seed": spec.seed,
             "n": spec.limit,
+            "evaluated_count": sum(r.get("gold_answer") is not None for r in results),
+            "request_count": len(requests_list),
+            "success_count": len(succeeded),
         }
 
-    baseline_simple = {k: {"accuracy": v.get("accuracy"), "ref": v.get("ref")} for k, v in baseline.items()}
-    gate = quality_gate.compute_quality_gate(run_results, tau=tau, baseline=baseline_simple)
+    gate = quality_gate.compute_quality_gate(run_results, tau=tau, baseline=baseline)
     gate["baseline_registry"] = str(registry_path)
-    # Merge per-dataset metadata.
     for name, meta in run_results.items():
-        gate.setdefault("datasets", {}).setdefault(name, {}).update({
-            "samples_file": meta.get("samples_file"),
-            "generation_log_file": meta.get("generation_log_file"),
-            "seed": meta.get("seed"),
-            "n": meta.get("n"),
-            "evaluated_count": meta.get("count"),
-        })
+        gate["datasets"][name].update({k: v for k, v in meta.items() if k != "accuracy"})
     return gate
-
-
-def _mock_metrics(task_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
-    """Generate placeholder metrics without contacting a server.  Useful for
-    testing the pipeline end-to-end without GPU time."""
-    config = load_scenario_config(task_dir)
-    return {
-        "scenario": config.get("scenario_id"),
-        "name": config.get("name"),
-        "model_id": args.model or os.environ.get("INFERENCE_BENCH_BASE_MODEL", "mock"),
-        "profiles": {
-            "mock": {
-                "request_count": 0,
-                "success_count": 0,
-                "failure_count": 0,
-                "failure_rate": 0.0,
-                "ttft": {"p50": None, "p90": None, "p99": None},
-                "itl": {"p50": None, "p90": None, "p99": None},
-                "generation_throughput_tokens_per_s": 0.0,
-                "request_throughput_req_per_s": 0.0,
-            },
-        },
-        "vram_peak_mb": 0.0,
-        "quality_check": {"pass": True, "note": "mock mode"},
-        "eval_pipeline": {"version": 1, "steps": ["mock"]},
-        "eval_mode": {"name": "mock"},
-    }
 
 
 def run_evaluation(task_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
     output_path: Optional[Path] = Path(args.json_output_file) if args.json_output_file else None
     artifact_dir = _artifact_dir(task_dir, output_path)
 
-    # Mock mode: skip server entirely and emit placeholder metrics.
-    if getattr(args, "mock", False) or os.environ.get("INFERENCE_BENCH_MOCK", "").lower() in {"1", "true", "yes"}:
-        metrics = _mock_metrics(task_dir, args)
-        if output_path is not None:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-        return metrics
-
     try:
-        quick_mode = bool(getattr(args, "quick", False))
-        quick_limit = int(getattr(args, "quick_request_limit", 24))
-        if quick_mode:
+        if args.quick:
             if args.request_limit is None:
-                args.request_limit = quick_limit
+                args.request_limit = args.quick_request_limit
             else:
-                args.request_limit = min(int(args.request_limit), quick_limit)
-            raw_qn = os.environ.get("INFERENCE_BENCH_QUICK_QUALITY_N", "16").strip()
-            try:
-                quick_quality_n = max(1, int(raw_qn))
-            except ValueError:
-                quick_quality_n = 16
-            os.environ.setdefault("INFERENCE_BENCH_QUALITY_MMLUPRO_N", str(quick_quality_n))
+                args.request_limit = min(args.request_limit, args.quick_request_limit)
 
         metrics = run_speed_eval(task_dir, args, artifact_dir)
+        profiles = metrics.get("profiles") or {}
+        failed_profiles = [name for name, profile in profiles.items() if not quality_gate.profile_complete(profile)]
+        speed_pass = bool(profiles) and not failed_profiles
+        metrics["speed_check"] = {"pass": speed_pass, "failed_profiles": failed_profiles}
+        if not speed_pass:
+            metrics["score"] = 0
 
         skip_quality = os.environ.get("INFERENCE_BENCH_SKIP_QUALITY", "").lower() in {"1", "true", "yes"}
         if not skip_quality:
@@ -1327,22 +1047,17 @@ def run_evaluation(task_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
                 args.quality_tau,
             )
             metrics["quality_check"] = quality
-            if not quality.get("pass", True):
+            if not quality["pass"]:
                 metrics["score"] = 0
         else:
-            metrics["quality_check"] = {"pass": True, "note": "skipped via INFERENCE_BENCH_SKIP_QUALITY"}
+            metrics["quality_check"] = {"pass": True, "skipped": True}
 
-        metrics.setdefault("eval_pipeline", {"version": 1, "steps": ["speed_eval", "quality_check"]})
-        if quick_mode:
-            qn = 0
-            try:
-                qn = int(os.environ.get("INFERENCE_BENCH_QUALITY_MMLUPRO_N", "0") or 0)
-            except ValueError:
-                qn = 0
+        metrics["eval_pipeline"] = {"version": 1, "steps": ["speed_eval", "quality_check"]}
+        if args.quick:
             metrics["eval_mode"] = {
                 "name": "quick",
-                "request_limit": int(args.request_limit) if args.request_limit is not None else quick_limit,
-                "quality_n": qn,
+                "request_limit": args.request_limit,
+                "quality_n": env_int("INFERENCE_BENCH_QUALITY_MMLUPRO_N", 500),
             }
 
         if output_path is not None:
@@ -1362,64 +1077,19 @@ def run_evaluation(task_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    def _env_float(name: str, default: float) -> float:
-        raw = os.environ.get(name, "").strip()
-        if not raw:
-            return default
-        try:
-            return float(raw)
-        except ValueError:
-            return default
-
     parser = argparse.ArgumentParser(description="InferenceBench scenario evaluator")
-    parser.add_argument("--server-url", type=str, default="http://127.0.0.1:8000")
-    # vLLM can take several minutes to become ready, especially if kernels are being
-    # compiled or very large prefill sizes are configured. Allow the harness to
-    # override these defaults via env vars.
-    parser.add_argument(
-        "--server-wait-s",
-        type=float,
-        default=_env_float("INFERENCE_BENCH_SERVER_WAIT_S", 900.0),
-    )
-    parser.add_argument(
-        "--request-timeout-s",
-        type=float,
-        default=_env_float("INFERENCE_BENCH_REQUEST_TIMEOUT_S", 300.0),
-    )
+    parser.add_argument("--server-url", type=str, default=os.environ.get("INFERENCE_BENCH_SERVER_URL") or "http://127.0.0.1:8000")
+    parser.add_argument("--server-wait-s", type=float, default=env_float("INFERENCE_BENCH_SERVER_WAIT_S", 900.0))
+    parser.add_argument("--request-timeout-s", type=float, default=env_float("INFERENCE_BENCH_REQUEST_TIMEOUT_S", 300.0))
     parser.add_argument("--model", type=str, default=os.environ.get("INFERENCE_BENCH_BASE_MODEL", ""))
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=int(os.environ.get("INFERENCE_BENCH_DATASET_SEED", "248")),
-        help="Seed for dataset sampling.",
-    )
-    parser.add_argument(
-        "--requests-file",
-        type=str,
-        default=None,
-        help="Optional requests.jsonl to reuse (skips dataset sampling). Can also be set via INFERENCE_BENCH_REQUESTS_FILE.",
-    )
+    parser.add_argument("--seed", type=int, default=env_int("INFERENCE_BENCH_DATASET_SEED", DEFAULT_SEED),
+                        help="Seed for request sampling and arrival schedules.")
+    parser.add_argument("--requests-file", type=str, default=None, help="Reuse this requests.jsonl instead of sampling.")
     parser.add_argument("--json-output-file", type=str, default=None)
     parser.add_argument("--request-limit", type=int, default=None)
-    parser.add_argument(
-        "--quick",
-        action="store_true",
-        help="Quick smoke-test mode: smaller speed request set and smaller quality subset.",
-    )
-    parser.add_argument(
-        "--quick-request-limit",
-        type=int,
-        default=int(os.environ.get("INFERENCE_BENCH_QUICK_REQUEST_LIMIT", "4")),
-        help="Max requests used when --quick is set.",
-    )
-    parser.add_argument("--quality-tau", type=float, default=float(os.environ.get("INFERENCE_BENCH_QUALITY_TAU", "0.95")))
-    parser.add_argument(
-        "--mock",
-        action="store_true",
-        help="Mock mode: skip server and emit placeholder metrics. "
-             "Useful for testing the pipeline end-to-end without GPU time. "
-             "Can also be set via INFERENCE_BENCH_MOCK=1.",
-    )
+    parser.add_argument("--quick", action="store_true", help="Run a smaller speed request set.")
+    parser.add_argument("--quick-request-limit", type=int, default=env_int("INFERENCE_BENCH_QUICK_REQUEST_LIMIT", 4))
+    parser.add_argument("--quality-tau", type=float, default=env_float("INFERENCE_BENCH_QUALITY_TAU", 0.95))
     return parser
 
 

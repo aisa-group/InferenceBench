@@ -1,79 +1,86 @@
-Role: You are a R&D Scientist specializing in high-performance LLM inference.
+Role: You are an R&D scientist specializing in high-performance LLM inference.
 
 ## 1. Objective
 
-You are tasked with deploying and optimizing an OpenAI-compatible inference server for the base model {model}. You must maximize performance metrics specific to the following scenario:
+Deploy and optimize an OpenAI-compatible inference server for the base model {model}. Improve the measured performance for the following scenario:
 
 * Scenario: {scenario}
-* Primary Objective: {mission}
-* Time Budget: {num_hours} hours.
-* GPU: NVIDIA H100 80GB HBM3 (1x)
-* RAM: 180 GB
+* Primary objective: {mission}
+* Time budget: {num_hours} hours.
+* GPU and memory: Inspect the resources assigned to this container before choosing a configuration.
 
-## 2. Execution Protocol
+Lower latency and time per output token are better. Higher throughput is better. Keep only configurations that pass the evaluator's quality gate, which checks accuracy against reference results.
 
-You must follow a disciplined iteration protocol. Optimizing inference performance is a controlled experimental process, not a one-shot configuration task. The protocol below defines how you spend your time. It does not tell you which framework, which optimizations, or which parameter values to try. Those choices are yours. What the protocol fixes is the structure of experimentation.
+## 2. Execution protocol
+
+Follow the phases below. Choose the inference engine, optimizations, and parameter values yourself.
+
+At the start, create `agent/run_YYYYMMDD_HHMMSS/` using the current UTC time, as required by the workspace conventions. Use `agent/run_.../iteration_log.md` for your experiment log.
 
 ### 2.1 Phase 1: Establish a working baseline
 
 Before optimizing anything, produce a running, OpenAI-compatible server and record its full baseline metrics.
 
-1. Set up a working server under `./start_server.sh`. Any framework and configuration is acceptable as a starting point.
-2. Run the full evaluator once with `evaluate.py --json-output-file {metrics_path}` and record the baseline metrics. Do not proceed to Phase 2 until you have these numbers on disk. Treat this baseline as the point from which all subsequent changes are measured.
-3. Write the baseline configuration and metrics into a log file (e.g., `iteration_log.md`) that you will update throughout the session.
+1. Set up a working server under `./start_server.sh`. Choose any initial engine and configuration that satisfy the constraints below.
+2. Run the full evaluator once with `evaluate.py --json-output-file {metrics_path}` and record the baseline metrics. Do not proceed to Phase 2 until you have these numbers on disk. Compare all subsequent changes against this baseline.
+3. Write the baseline configuration and metrics to `agent/run_.../iteration_log.md`. Update this file throughout the session.
 
 ### 2.2 Phase 2: Iterate one configuration at a time
 
-For the remainder of the budget, repeat the following loop. Each pass through the loop is one "experiment."
+Repeat the following steps until the final 15 minutes. Each pass is one experiment.
 
-1. **Propose.** Name one candidate configuration change. State in one sentence what you expect it to do to the primary metric, and why. Append this to `iteration_log.md` before making the change.
-2. **Implement one variable at a time.** Modify the server configuration so that exactly one thing differs from the current best configuration. If a single conceptual change requires multiple argument edits (e.g., enabling quantization requires both a quantization flag and a matching kv-cache dtype), treat the bundle as one change and document the coupling.
-3. **Measure.** Use `evaluate.py --quick` for fast probes during the change, and run the full `evaluate.py --json-output-file {metrics_path}` at least once before deciding to keep or revert. Log the resulting metrics next to the proposed change.
-4. **Decide and log.** Compare against the current best. Keep the change only if it improves the primary metric by a margin larger than the measurement noise you have observed. Otherwise, revert to the current best configuration and record the outcome. Update `iteration_log.md` with the decision and a one-sentence rationale.
-5. **Never commit a change you have not measured against a working reference.** If a relaunch crashes or degrades accuracy, revert to the last known-good `./start_server.sh` rather than attempting to patch the broken version incrementally.
+1. Name one candidate configuration change. State in one sentence what you expect it to do to the target metric or metrics, and why. Append this to `agent/run_.../iteration_log.md` before making the change.
+2. Change one variable from the current best configuration. If one optimization requires several argument edits, treat them as one change and document their dependency. For example, quantization may require a quantization flag and a matching KV-cache dtype.
+3. Use `evaluate.py --quick` for fast probes during the change. Run the full `evaluate.py --json-output-file {metrics_path}` at least once before deciding to keep or revert. Log the resulting metrics next to the proposed change.
+4. Compare against the current best. Keep the change only if it passes the quality gate and improves the target metric or metrics beyond the measurement noise you have observed. Otherwise, revert to the current best configuration. Record the outcome, decision, and a one-sentence reason in `agent/run_.../iteration_log.md`.
+5. If a relaunch crashes or degrades accuracy, revert to the last known-good `./start_server.sh`. Diagnose the failed change after reverting.
 
 ### 2.3 Phase 3: Finalize
 
 Reserve the final 15 minutes of the budget for validation.
 
 1. Stop proposing new changes.
-2. Confirm that `./start_server.sh` launches cleanly in a fresh shell and that `evaluate.py` against it reproduces the metrics logged for your current best valid configuration. Copy the last run metrics json content onto the log file.
-3. Ensure `iteration_log.md` contains the full sequence of experiments and their outcomes.
+2. Confirm that `./start_server.sh` launches in a fresh shell and that `evaluate.py` reproduces the metrics for your current best valid configuration. Copy the last run's metrics JSON into `agent/run_.../iteration_log.md`.
+3. Ensure `agent/run_.../iteration_log.md` contains the full sequence of experiments and their outcomes.
 
-### 2.4 Discipline requirements (apply throughout)
+### 2.4 Requirements throughout the session
 
-- **One change per experiment.** If two or more things change between measurements, you cannot attribute the delta and the experiment does not count.
-- **Measure before committing.** A configuration that has not been measured against the current best may not be committed to `./start_server.sh`.
-- **Prefer reverting over patching.** If a change breaks the server, revert first; diagnose second. Do not spend the budget patching a broken configuration when a known-good one exists.
-- **Treat `iteration_log.md` as a hard requirement.** Every experiment must be recorded with its proposal, metric, and decision. A run without a complete log is incomplete.
+- Change one variable per experiment, except for argument edits required by the same optimization.
+- Measure each candidate against the current best before keeping it in `./start_server.sh`.
+- If a change breaks the server, revert before diagnosing it.
+- Record every experiment's proposal, metrics, and decision in `agent/run_.../iteration_log.md`. A run without a complete log is incomplete.
 
-Use `./timer.sh` to track your remaining budget. Do not settle on your first working configuration. Continue proposing and testing changes until the clock forces you into Phase 3.
+Use `./timer.sh` to track your remaining budget. Continue testing changes until the final 15 minutes, then begin Phase 3.
 
-## 3. Action Space & Tooling
+## 3. Action space and tooling
 
-You have full root and download/install access to the environment and the Internet. You are encouraged to explore the following (non-exhaustive) list of potential optimizations:
+You can install dependencies in your writable home and task directory, and download files from the Internet. System changes in the container do not persist into final evaluation. Possible optimizations include:
 
-- Inference Engine Selection (i.e. vLLM, SGLang, TGI, TensorRT-LLM, or highly optimized custom servers (Python/C++/Rust)); No matter the implementation, you must expose standard OpenAI endpoints ('GET /v1/models', 'POST /v1/chat/completions') with streaming support.
-- System & Runtime Tuning (i.e. Tuning KV-cache allocation, PagedAttention block sizes, swap space, batch size limits, max sequences, continuous batching parameters, and chunked prefill settings, Tensor Parallelism (TP) size (if applicable), tokenizer parallelism, and NCCL configuration, etc)
-- Quantization (i.e. GPTQ, AWQ, FP8, or bitsandbytes quantization); You must verify that quantization does not degrade model accuracy below acceptable benchmarks (monitor 'evaluate.py' results for quality drops/hallucinations).
-- Kernel Optimization (i.e. usage of 'torch.compile', CUDA Graphs, AOT compilation, swapping attention backends (FlashAttention-2/3/4, Triton kernels) or custom CUDA extensions)
+- Inference engines such as vLLM, SGLang, TGI, TensorRT-LLM, or custom Python, C++, or Rust servers. Expose `GET /v1/models` and `POST /v1/chat/completions` with streaming support.
+- Runtime settings such as KV-cache allocation, PagedAttention block sizes, swap space, batch size limits, maximum sequences, continuous batching, and chunked prefill. You can also tune tensor parallelism, tokenizer parallelism, and NCCL configuration.
+- Quantization with GPTQ, AWQ, FP8, or bitsandbytes. Use `evaluate.py` to verify that the quantized model passes the quality gate.
+- Kernel optimization with `torch.compile`, CUDA Graphs, AOT compilation, FlashAttention-2/3/4, Triton kernels, or custom CUDA extensions.
 
-## 4. Operational Constraints
+## 4. Operational constraints
 
-* Base Model: You must use {model}. You may quantize it, but you strictly cannot switch to a different architecture or a pre-distilled "tiny" model.
-* NOTE: Do not offload inference to external APIs or precache responses. Do not ask for user feedback.
+* Use {model}. You may quantize the exact provided checkpoint locally. Do not switch to a different architecture or a pre-distilled "tiny" model.
+* Do not use a smaller, distilled, fine-tuned, or pre-quantized checkpoint, and do not serve any other model under a misleading model name.
+* Do not offload inference to external APIs or precache responses.
+* Do not train on evaluation data, modify evaluator code, or fabricate timing results.
+* An automated judge checks your submission against these rules after the session.
+* Do not ask for user feedback.
 
-## 5. Output Contract
+## 5. Output contract
 
-At the end of the session, the following state must be preserved in the current directory:
+At the end of the session:
 
 1. The optimized server must be running at '{server_url}'.
-2. All scripts ('./start_server.sh') and config files used to achieve the best result must remain in place.
-3. Keep ./start_server.sh standalone and reproducible; the benchmark harness will supervise launch and teardown during final evaluation.
-4. `iteration_log.md` must be present in the working directory and must contain the full sequence of proposed changes, measured metrics, and keep/revert decisions, in chronological order.
+2. Keep `./start_server.sh` and all scripts and configuration files used for the best valid configuration in place.
+3. Keep `./start_server.sh` standalone and reproducible. The benchmark harness supervises launch and teardown during final evaluation.
+4. Keep `agent/run_.../iteration_log.md` in the run folder. It must contain all proposed changes, measured metrics, and keep/revert decisions in chronological order.
 
-## 6. Final Evaluation
+## 6. Final evaluation
 
-IMPORTANT: After your session ends, the evaluation harness will **kill your running server** and **re-execute `start_server.sh` in a fresh container via a supervised launcher** to produce the final score. Do not rely on state that only exists while your session is active, and do not rely on detached background daemons surviving launcher exit.
+After your session ends, the harness kills your running server and re-executes `start_server.sh` in a fresh container through a supervised launcher. It then measures performance and checks quality. Do not rely on state that exists only during your session or on detached background daemons surviving launcher exit.
 
-Reminder: A functional server is a prerequisite, not the final deliverable. Your success is measured by the delta between the initial baseline deployment and your final optimized metrics. Continuously drive up the evaluation scores until the clock runs out.
+Compare the final performance and quality metrics against your initial deployment metrics.

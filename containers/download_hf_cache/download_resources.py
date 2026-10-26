@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""Download HuggingFace models and datasets listed in a resources JSON file.
 
-Expected JSON format:
-{
-    "models": ["meta-llama/Meta-Llama-3.1-8B-Instruct", ...],
-    "datasets": [
-        {"dataset": "cais/mmlu", "configs": ["all"], "splits": ["test"]},
-        ...
-    ]
-}
-
-Usage:
-    python download_resources.py --resources-file /path/to/resources.json [--workers 4]
-"""
 from __future__ import annotations
 
 import argparse
@@ -23,50 +10,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
-def download_model(model_id: str) -> str:
-    """Download a model snapshot to the HF cache."""
-    # SoftFileLock workaround for lustre
-    try:
-        import filelock
-        from filelock import SoftFileLock
-        filelock.FileLock = SoftFileLock
-    except Exception:
-        pass
+def download_model(model_id: str) -> None:
+    import filelock
 
+    filelock.FileLock = filelock.SoftFileLock
     from huggingface_hub import snapshot_download
 
-    print(f"[download] downloading model: {model_id}")
-    # Try local_files_only first (fast, no network/locks)
-    try:
-        path = snapshot_download(model_id, local_files_only=True)
-        print(f"[download] model {model_id} -> {path} (local cache hit)")
-        return path
-    except Exception:
-        pass
-
-    path = snapshot_download(
-        model_id,
-        resume_download=True,
-        max_workers=1,
-        token=os.environ.get("HF_TOKEN"),
-    )
-    print(f"[download] model {model_id} -> {path}")
-    return path
+    print(f"[download] model {model_id}")
+    snapshot_download(model_id, max_workers=1, token=os.environ.get("HF_TOKEN"))
 
 
 def download_dataset(dataset_id: str, configs: list[str], splits: list[str]) -> None:
-    """Download dataset configs/splits to the HF cache."""
     from datasets import load_dataset
 
     for config in configs:
         for split in splits:
-            print(f"[download] downloading dataset: {dataset_id} config={config} split={split}")
-            try:
-                load_dataset(dataset_id, config, split=split)
-                print(f"[download] dataset {dataset_id}/{config}/{split} cached")
-            except Exception as exc:
-                print(f"[download] WARNING: failed to download {dataset_id}/{config}/{split}: {exc}",
-                      file=sys.stderr)
+            print(f"[download] dataset {dataset_id} config={config} split={split}")
+            load_dataset(dataset_id, config, split=split)
 
 
 def main() -> None:
@@ -74,6 +34,8 @@ def main() -> None:
     parser.add_argument("--resources-file", required=True, help="Path to JSON resources file.")
     parser.add_argument("--workers", type=int, default=4, help="Number of parallel download workers.")
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be positive")
 
     resources_path = Path(args.resources_file)
     if not resources_path.is_file():
@@ -84,9 +46,6 @@ def main() -> None:
     models = resources.get("models", [])
     datasets = resources.get("datasets", [])
 
-    print(f"[download] {len(models)} model(s), {len(datasets)} dataset(s) to download")
-
-    # Download models (sequentially — these are large)
     for model_id in models:
         try:
             download_model(model_id)
@@ -94,7 +53,7 @@ def main() -> None:
             print(f"[download] ERROR downloading model {model_id}: {exc}", file=sys.stderr)
             sys.exit(1)
 
-    # Download datasets (can parallelize)
+    failed = False
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {}
         for ds in datasets:
@@ -110,8 +69,10 @@ def main() -> None:
                 fut.result()
             except Exception as exc:
                 print(f"[download] ERROR downloading dataset {ds_id}: {exc}", file=sys.stderr)
+                failed = True
 
-    print("[download] all resources downloaded successfully")
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
