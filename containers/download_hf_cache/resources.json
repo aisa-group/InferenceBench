@@ -1,0 +1,7 @@
+{
+  "models": ["mistralai/Mistral-7B-Instruct-v0.3"],
+  "datasets": [
+    {"dataset": "TIGER-Lab/MMLU-Pro", "configs": ["default"], "splits": ["test"]},
+    {"dataset": "THUDM/LongBench-v2", "configs": ["default"], "splits": ["train"]}
+  ]
+}

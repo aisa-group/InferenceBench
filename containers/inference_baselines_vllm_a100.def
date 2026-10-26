@@ -1,6 +1,11 @@
 Bootstrap: docker
 From: nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
 
+%files
+    containers/locks/inference_baselines_vllm_a100.txt /opt/inferencebench/constraints.txt
+    containers/hpo-requirements.txt /opt/inferencebench/hpo-requirements.txt
+    containers/hpo-constraints.txt /opt/inferencebench/hpo-constraints.txt
+
 %post
     chmod 1777 /tmp
     export DEBIAN_FRONTEND=noninteractive
@@ -12,7 +17,6 @@ From: nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
 
     mkdir -p "${TMPDIR}" "${UV_CACHE_DIR}" "${PIP_CACHE_DIR}"
 
-    # Update and install system dependencies
     apt-get update && apt-get install -y \
         python3.10 \
         python3-dev \
@@ -24,99 +28,69 @@ From: nvidia/cuda:12.9.1-cudnn-devel-ubuntu22.04
         build-essential \
         && rm -rf /var/lib/apt/lists/*
 
-    # Create python3 symlink
     ln -sf /usr/bin/python3.10 /usr/bin/python3
     ln -sf /usr/bin/python3.10 /usr/bin/python
-    
-    # Install Node.js (LTS version 22.x) for npm
+
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    apt-get install -y nodejs
-    
-    # Install uv
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    apt-get install -y nodejs=22.22.2-1nodesource1
+
+    curl -LsSf https://astral.sh/uv/0.11.7/install.sh | sh
     export PATH="/root/.local/bin:$PATH"
-    
-    # Ensure CUDA torch is installed (PyPI default may resolve to CPU-only torch).
-    uv pip install --system --no-cache \
-        --index-url https://download.pytorch.org/whl/cu128 \
-        torch==2.8.0 \
-        torchvision==0.23.0 \
-        torchaudio==2.8.0
 
-    # Install xformers from PyTorch index (vllm 0.11.0 requires 0.0.32.post1 which
-    # only resolves from the cu128 wheel index, not vanilla PyPI).
-    uv pip install --system --no-cache \
-        --index-url https://download.pytorch.org/whl/cu128 \
-        xformers==0.0.32.post1 || \
-        echo "[inference_baselines_vllm.def] WARN: xformers 0.0.32.post1 install failed; trying latest."
-    uv pip install --system --no-cache xformers 2>/dev/null || true
+    uv pip install --system --no-cache --constraint /opt/inferencebench/constraints.txt \
+        --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu128 \
+        torch==2.8.0+cu128 \
+        torchvision==0.23.0+cu128 \
+        torchaudio==2.8.0+cu128
 
-    uv pip install --system --no-cache --no-deps vllm==0.11.0
-    uv pip install --system --no-cache vllm==0.11.0 --torch-backend=auto 2>/dev/null || true
+    uv pip install --system --no-cache --constraint /opt/inferencebench/constraints.txt \
+        --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu128 \
+        xformers==0.0.32.post1
 
-    # flashinfer: PyPI package name is "flashinfer-python", not "flashinfer".
-    # It depends on apache-tvm-ffi (a pre-release), so --prerelease=allow is needed.
-    uv pip install --system --no-cache --prerelease=allow flashinfer-python || \
-        echo "[inference_baselines_vllm.def] WARN: flashinfer-python install failed; continuing."
-    
-    # Install AI CLI tools via npm
+    uv pip install --system --no-cache --constraint /opt/inferencebench/constraints.txt vllm==0.11.0 --torch-backend=auto
+
+    uv pip install --system --no-cache --constraint /opt/inferencebench/constraints.txt flashinfer-python==0.6.8.post1
+
     npm install -g \
-        @anthropic-ai/claude-code \
-        @openai/codex \
-        @google/gemini-cli
-    
-    uv pip install --system --no-cache ninja packaging wheel setuptools
-    
-    # Install the required packages
-    uv pip install --system --no-cache \
-        accelerate \
-        boto3 \
-        bitsandbytes \
-        datasets \
-        evaluate \
-        lm-eval \
-        openai \
-        pandas \
-        scikit-learn \
-        shortuuid \
-        tokenizers \
-        transformers \
-        trl \
-        peft \
-        inspect-ai \
-        tiktoken \
-        matplotlib \
-        certifi
+        @anthropic-ai/claude-code@2.1.116 \
+        @openai/codex@0.164.0 \
+        @google/gemini-cli@0.38.2
 
-    # flash-attn requires a CUDA-enabled torch + nvcc toolchain at build time.
-    # On some build hosts, dependency resolution picks CPU torch, which makes
-    # flash-attn fail hard and abort the entire container build.
-    # Keep it best-effort so baseline image creation stays reliable.
+    uv pip install --system --no-cache --constraint /opt/inferencebench/constraints.txt ninja==1.13.0 packaging==26.1 wheel==0.37.1 setuptools==59.6.0
+
+    uv pip install --system --no-cache --constraint /opt/inferencebench/constraints.txt \
+        accelerate==1.13.0 \
+        boto3==1.40.61 \
+        bitsandbytes==0.49.2 \
+        datasets==4.8.4 \
+        evaluate==0.4.6 \
+        lm-eval==0.4.11 \
+        openai==2.32.0 \
+        pandas==2.3.3 \
+        scikit-learn==1.7.2 \
+        shortuuid==1.0.13 \
+        tokenizers==0.22.2 \
+        transformers==5.5.4 \
+        trl==1.2.0 \
+        peft==0.19.1 \
+        inspect-ai==0.3.209 \
+        tiktoken==0.12.0 \
+        matplotlib==3.10.8 \
+        certifi==2026.2.25
+
     export CUDA_HOME="/usr/local/cuda"
-    if command -v nvcc >/dev/null 2>&1 && python3 - <<'PY'
-import torch
-raise SystemExit(0 if getattr(torch.version, "cuda", None) else 1)
-PY
-    then
-        uv pip install --system --no-cache flash_attn --no-build-isolation || \
-            echo "[inference_baselines_vllm.def] WARN: flash_attn install failed; continuing."
-    else
-        echo "[inference_baselines_vllm.def] INFO: skipping flash_attn (no nvcc or CUDA torch)."
-    fi
-    
-    # install inspect evals (best-effort: latest versions require Python>=3.11)
-    mkdir -p /opt
-    cd /opt
-    git clone --depth=1 https://github.com/UKGovernmentBEIS/inspect_evals.git || true
-    if [ -d /opt/inspect_evals ]; then
-        cd /opt/inspect_evals
-        uv pip install --system --no-cache . 2>/dev/null || \
-            echo "[inference_baselines_vllm.def] WARN: inspect_evals install failed (needs Python>=3.11); skipping."
-    fi
+    uv pip install --system --no-cache --constraint /opt/inferencebench/constraints.txt flash_attn==2.8.3 --no-build-isolation
 
-    cd /opt
-    git clone https://github.com/rank-and-file/filelock_workarounds.git
-    
+    uv pip install --system --no-cache --constraint /opt/inferencebench/constraints.txt \
+        --constraint /opt/inferencebench/hpo-constraints.txt \
+        -r /opt/inferencebench/hpo-requirements.txt
+
+    git clone --no-checkout https://github.com/UKGovernmentBEIS/inspect_evals.git /opt/inspect_evals
+    git -C /opt/inspect_evals checkout --detach 3dad175e20e9af21a5ecbabccefc004b8bbfe692
+
+    git clone --no-checkout https://github.com/rank-and-file/filelock_workarounds.git /opt/filelock_workarounds
+    git -C /opt/filelock_workarounds checkout --detach e6e8ae16b3d8827e6089eb950dd45cfb93fb58bd
+
 %environment
     export PATH="/root/.local/bin:$PATH"
     export NO_PROXY="localhost,127.0.0.1"
@@ -125,10 +99,3 @@ PY
 
 %runscript
     exec python3 "$@"
-
-%labels
-    Version v1.0
-    Description Python ML container with CUDA support for transformers and LLM training (using uv) + AI CLI tools
-
-%help
-    Note: Use the --nv flag to enable NVIDIA GPU support when running the container.

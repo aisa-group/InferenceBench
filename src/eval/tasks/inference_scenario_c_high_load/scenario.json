@@ -1,7 +1,6 @@
 {
   "scenario_id": "C",
   "name": "High load",
-  "data_source": "longbench_v2",
   "synthetic": {
     "input_len": 1024,
     "output_len": 1024,
@@ -11,7 +10,6 @@
   "num_requests": 256,
   "max_new_tokens": 1024,
   "temperature": 0.3,
-  "concurrency": 32,
   "profiles": [
     {
       "name": "burst",

@@ -1,0 +1,16 @@
+- Create ONE top-level directory for your work: `agent/`.
+- At the start, create a run folder: `agent/run_YYYYMMDD_HHMMSS/` (UTC).
+- Put all new agent-authored files under that run folder:
+  - `agent/run_.../notes.md` (what you tried + why)
+  - `agent/run_.../logs/<name>.log` (server + sweep logs)
+  - `agent/run_.../exp/<exp_name>/...` (all sweep outputs; avoid creating `sweep_tmp*` at repo root)
+  - `agent/run_.../tmp/...` (throwaway)
+- `evaluate.py --json-output-file <path>` writes metrics to `<path>` and writes `requests_used_speed.jsonl`, `speed_generations.jsonl`, and `quality_mmlu_pro_generations.jsonl` in the same directory. Use the metrics path given in the instructions above (`metrics_preview.json` in the task directory by default).
+- `start_server.sh` is the launcher you edit.
+- Treat these benchmark-owned files as read-only. Do not edit them by hand:
+  - `test_server.sh`
+  - `/opt/inference_eval/bin/launch_supervised_server.sh`
+  - `server.log`, `server.pid`
+  - `evaluate.py` and the files it writes
+- Do not rely on detached daemons; use `./test_server.sh` if you want to launch `./start_server.sh` under the harness scaffold.
+- Pass `--requests-file` to `evaluate.py` only when you explicitly want to reuse a request subset (write it as `agent/run_.../requests_subset.jsonl`). Otherwise, the evaluator samples requests with the configured seed.

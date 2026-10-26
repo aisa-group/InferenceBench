@@ -6,7 +6,7 @@ TASK_DIR = Path(__file__).resolve().parent
 EVAL_DIR = TASK_DIR.parents[1]
 sys.path.insert(0, str(EVAL_DIR))
 
-from inference.runner import build_parser, run_evaluation  # noqa: E402
+from inference.runner import build_parser, run_evaluation
 
 
 def main() -> None:

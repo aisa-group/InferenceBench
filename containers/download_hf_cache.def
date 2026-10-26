@@ -1,19 +1,19 @@
 Bootstrap: docker
-From: python:3.10-slim
+From: python:3.10.20-slim
+
+%files
+    containers/locks/download_hf_cache.txt /opt/inferencebench/constraints.txt
 
 %post
     apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
 
-    pip install --no-cache-dir \
-        "datasets>=4.0" \
-        "huggingface-hub>=0.36.0" \
-        "transformers" \
-        "filelock" \
-        "fsspec" \
-        "aiohttp"
+    pip install --no-cache-dir --constraint /opt/inferencebench/constraints.txt \
+        "datasets==4.8.4" \
+        "huggingface-hub==1.8.0" \
+        "transformers==5.4.0" \
+        "filelock==3.25.2" \
+        "fsspec==2026.2.0" \
+        "aiohttp==3.13.5"
 
 %runscript
     exec python3 "$@"
-
-%labels
-    Description Lightweight container for downloading HuggingFace models and datasets

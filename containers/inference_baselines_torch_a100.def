@@ -1,13 +1,15 @@
 Bootstrap: docker
 From: nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
 
+%files
+    containers/locks/inference_baselines_torch_a100.txt /opt/inferencebench/constraints.txt
+
 %post
     chmod 1777 /tmp
     export DEBIAN_FRONTEND=noninteractive
     export TMPDIR="/opt/tmp"
     export UV_CACHE_DIR="/opt/uv_cache"
-    # Large CUDA wheels (e.g., `nvidia-cusparselt-cu12`) often exceed the default
-    # 30s timeout on shared clusters.
+
     export UV_HTTP_TIMEOUT="600"
     export UV_LINK_MODE="copy"
 
@@ -32,9 +34,6 @@ From: nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
         build-essential \
         && rm -rf /var/lib/apt/lists/*
 
-    # Provide `nvidia-smi` for debugging when available. Depending on the runtime
-    # (Docker/Apptainer) and GPU passthrough mode, the real binary may be bound
-    # into one of these paths; this wrapper makes it reachable on PATH.
     cat >/usr/local/bin/nvidia-smi <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -47,7 +46,7 @@ do
     exec "${candidate}" "$@"
   fi
 done
-echo "nvidia-smi: not found in container (try running with GPU passthrough, e.g. Apptainer --nv)." >&2
+echo "nvidia-smi: not found; run the container with --nv." >&2
 exit 127
 EOF
     chmod +x /usr/local/bin/nvidia-smi
@@ -55,38 +54,25 @@ EOF
     ln -sf /usr/bin/python3.10 /usr/bin/python3
     ln -sf /usr/bin/python3.10 /usr/bin/python
 
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    apt-get install -y nodejs
-
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    curl -LsSf https://astral.sh/uv/0.11.7/install.sh | sh
     export PATH="/root/.local/bin:$PATH"
 
-    npm install -g \
-        @anthropic-ai/claude-code \
-        @openai/codex \
-        @google/gemini-cli
+    uv pip install --system --no-cache --constraint /opt/inferencebench/constraints.txt \
+        --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu121 \
+        torch==2.5.1+cu121
 
-    # A100 nodes on this cluster run driver 545.x → CUDA 12.3 runtime ceiling.
-    # The default torch wheel from PyPI is built against CUDA 13.0 and fails to
-    # initialize CUDA here ("driver too old, found version 12030"). Pin torch
-    # to a cu121 build which is compatible with driver 545+.
-    uv pip install --system --no-cache \
-        --index-url https://download.pytorch.org/whl/cu121 \
-        torch==2.5.1
+    uv pip install --system --no-cache --constraint /opt/inferencebench/constraints.txt \
+        aiohttp==3.13.5 \
+        requests==2.33.1 \
+        accelerate==1.13.0 \
+        datasets==4.8.4 \
+        sentencepiece==0.2.1 \
+        numpy==2.2.6 \
+        tokenizers==0.22.2 \
+        transformers==5.5.4
 
-    uv pip install --system --no-cache \
-        aiohttp \
-        requests \
-        accelerate \
-        datasets \
-        sentencepiece \
-        numpy \
-        tokenizers \
-        transformers
-
-    # filelock workaround for /fast (no filelocking)
-    cd /opt
-    git clone https://github.com/rank-and-file/filelock_workarounds.git
+    git clone --no-checkout https://github.com/rank-and-file/filelock_workarounds.git /opt/filelock_workarounds
+    git -C /opt/filelock_workarounds checkout --detach e6e8ae16b3d8827e6089eb950dd45cfb93fb58bd
 
 %environment
     export PATH="/root/.local/bin:$PATH"
@@ -97,10 +83,3 @@ EOF
 
 %runscript
     exec python3 "$@"
-
-%labels
-    Version v1.0
-    Description Minimal inference container for InferenceBench
-
-%help
-    Note: Use the --nv flag to enable NVIDIA GPU support when running the container.
